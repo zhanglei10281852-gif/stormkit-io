@@ -1,0 +1,503 @@
+@font-face {
+  font-family: 'Roboto';
+  font-style: normal;
+  font-weight: 400;
+  src: url(./assets/fonts/Roboto-Regular.woff2) format('woff2');
+}
+
+@font-face {
+  font-family: 'Roboto';
+  font-style: normal;
+  font-weight: 500;
+  src: url(./assets/fonts/Roboto-Medium.woff2) format('woff2');
+}
+
+@font-face {
+  font-family: 'Roboto';
+  font-style: normal;
+  font-weight: 600;
+  src: url(./assets/fonts/Roboto-Bold.woff2) format('woff2');
+}
+
+html,
+body {
+  padding: 0;
+  margin: 0;
+  box-sizing: border-box;
+  max-width: 100vw;
+  min-height: 100vh;
+  overflow-x: visible;
+  font-display: block;
+  font-family: Roboto, Helvetica;
+  -webkit-font-smoothing: antialiased;
+  letter-spacing: normal;
+  line-height: 2;
+  text-size-adjust: 100%;
+}
+
+*,
+*:before,
+*:after {
+  box-sizing: inherit;
+}
+
+@keyframes fadeInUp {
+  0% {
+    opacity: 0;
+    transform: translateY(30px);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@keyframes rotate {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes slideUp {
+  0% {
+    top: 100%;
+  }
+
+  10%,
+  100% {
+    top: 0;
+  }
+}
+
+@keyframes fadeIn {
+  to {
+    opacity: 1;
+  }
+}
+
+#blog-content {
+  line-height: 1.8;
+  letter-spacing: normal;
+  font-size: 1.0625rem;
+  color: rgba(255, 255, 255, 0.82);
+}
+
+/* The opening paragraph carries the reader in from the hero, so it is set a
+   step larger and lighter than the body that follows. */
+#blog-content > p:first-of-type {
+  font-size: 1.175rem;
+  line-height: 1.65;
+  color: rgba(255, 255, 255, 0.9);
+  margin-bottom: 2rem;
+}
+
+#blog-content > *:first-child {
+  margin-top: 0;
+}
+
+#blog-content p {
+  margin: 0 0 1.5rem;
+}
+
+#blog-content strong {
+  color: #cbc2b4;
+  font-weight: 600;
+}
+
+#blog-content h1 {
+  margin-top: 0;
+}
+
+#blog-content h2 {
+  position: relative;
+  font-size: 1.6rem;
+  font-weight: 600;
+  line-height: 1.25;
+  letter-spacing: -0.02em;
+  color: #fff;
+  margin: 4rem 0 1.5rem;
+  scroll-margin-top: 90px;
+  text-wrap: balance;
+}
+
+/* A short accent rule above each section reads as a chapter break without the
+   heavy full-width divider a border-bottom draws across the column. */
+#blog-content h2::before {
+  content: '';
+  display: block;
+  width: 2.5rem;
+  height: 2px;
+  margin-bottom: 1.25rem;
+  border-radius: 2px;
+  background: linear-gradient(90deg, #e2ae5a, rgba(239, 71, 111, 0.6));
+}
+
+#blog-content h3 {
+  scroll-margin-top: 90px;
+  color: #fff;
+  font-size: 1.15rem;
+  font-weight: 600;
+  line-height: 1.4;
+  margin: 2.5rem 0 0.75rem;
+}
+
+#blog-content h4 {
+  font-size: 1rem;
+  font-weight: 600;
+  margin: 2rem 0 0.5rem;
+  color: #cbc2b4;
+}
+
+#blog-content ul,
+#blog-content ol {
+  margin: 0 0 1.5rem;
+  padding-left: 1.35rem;
+}
+
+#blog-content li {
+  margin-bottom: 0.5rem;
+  padding-left: 0.25rem;
+}
+
+#blog-content li::marker {
+  color: rgba(226, 174, 90, 0.7);
+}
+
+#blog-content blockquote {
+  margin: 2.5rem 0;
+  padding: 1.25rem 1.5rem;
+  border: 0;
+  border-left: 2px solid #e2ae5a;
+  border-radius: 0 0.5rem 0.5rem 0;
+  background: linear-gradient(
+    90deg,
+    rgba(226, 174, 90, 0.07),
+    rgba(226, 174, 90, 0)
+  );
+  color: rgba(255, 255, 255, 0.88);
+  font-size: 1.05rem;
+}
+
+#blog-content blockquote p:last-child {
+  margin-bottom: 0;
+}
+
+#blog-content hr {
+  border: 0;
+  border-top: 1px solid rgba(255, 255, 255, 0.08);
+  margin: 3rem 0;
+}
+
+#blog-content img {
+  display: block;
+  max-width: calc(100% - 4rem);
+  margin: auto;
+}
+
+#blog-content .img-wrapper {
+  margin: 2rem auto;
+  cursor: pointer;
+  padding: 2rem;
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  background-color: rgba(0, 0, 0, 0.1);
+  border-radius: 0.25rem;
+}
+
+#blog-content .img-wrapper img {
+  box-shadow: 0px 3px 3px -2px rgba(0, 0, 0, 0.2),
+    0px 3px 4px 0px rgba(0, 0, 0, 0.14), 0px 1px 8px 0px rgba(0, 0, 0, 0.12);
+}
+
+/* Video embeds are authored with the width/height attributes YouTube's share
+   dialog produces. Overriding both with an aspect ratio makes them fill the
+   column and scale on narrow screens, so a post never has to hand-tune them. */
+#blog-content iframe {
+  display: block;
+  width: 100%;
+  height: auto;
+  aspect-ratio: 16 / 9;
+  margin: 2rem 0;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 0.5rem;
+  background-color: rgba(0, 0, 0, 0.25);
+}
+
+#blog-content table {
+  border-collapse: collapse;
+  width: 100%;
+  margin: 2rem 0;
+  font-size: 0.9rem;
+  border: 1px solid rgba(255, 255, 255, 0.07);
+  border-radius: 0.625rem;
+  overflow: hidden;
+}
+
+#blog-content table th {
+  padding: 0.75rem 1rem;
+  background-color: rgba(0, 0, 0, 0.25);
+  border: 0;
+  border-bottom: 1px solid rgba(226, 174, 90, 0.25);
+  text-align: left;
+  font-weight: 600;
+  font-size: 0.75rem;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.6);
+}
+
+#blog-content table td {
+  background-color: rgba(0, 0, 0, 0.1);
+  border: 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+  padding: 0.75rem 1rem;
+  vertical-align: top;
+}
+
+#blog-content table tr:hover td {
+  background-color: rgba(255, 255, 255, 0.02);
+}
+
+#blog-content table td:first-of-type {
+  width: 1%;
+  white-space: nowrap;
+}
+
+#blog-content a {
+  color: #e2ae5a;
+  text-decoration: none;
+  border-bottom: 1px solid rgba(226, 174, 90, 0.3);
+}
+
+#blog-content a:hover {
+  border-bottom-color: #e2ae5a;
+}
+
+/* Inline code sits inside running prose, so it gets a chip. The descendant
+   rules below opt code blocks back out — a <code> inside a <pre> is the block
+   itself and Prism paints it. */
+#blog-content code {
+  background-color: rgba(255, 255, 255, 0.07);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 0.25rem;
+  padding: 0.1rem 0.35rem;
+  font-size: 0.85em;
+  word-break: break-word;
+  overflow-wrap: break-word;
+}
+
+#blog-content pre {
+  position: relative;
+  max-width: 100%;
+  overflow-x: auto;
+  font-size: 0.82rem;
+  line-height: 1.7;
+  margin: 2rem 0;
+  padding: 1.75rem 1.25rem 1.25rem;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 0.625rem;
+  background-color: rgba(0, 0, 0, 0.32);
+}
+
+/* Prism stamps the language onto the <pre> as language-*. Naming it in the
+   corner tells the reader what they are looking at before they parse it.
+   Done in CSS rather than JS so it survives server-side rendering; a language
+   without a rule below simply shows no label. */
+#blog-content pre[class*='language-']::before {
+  position: absolute;
+  top: 0.5rem;
+  right: 0.875rem;
+  font-size: 0.625rem;
+  font-weight: 600;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  color: rgba(255, 255, 255, 0.28);
+}
+
+#blog-content pre.language-go::before {
+  content: 'Go';
+}
+#blog-content pre.language-bash::before {
+  content: 'Shell';
+}
+#blog-content pre.language-json::before {
+  content: 'JSON';
+}
+#blog-content pre.language-yaml::before {
+  content: 'YAML';
+}
+#blog-content pre.language-typescript::before {
+  content: 'TypeScript';
+}
+#blog-content pre.language-javascript::before {
+  content: 'JavaScript';
+}
+#blog-content pre.language-sql::before {
+  content: 'SQL';
+}
+#blog-content pre.language-docker::before {
+  content: 'Dockerfile';
+}
+#blog-content pre.language-diff::before {
+  content: 'Diff';
+}
+#blog-content pre.language-regex::before {
+  content: 'Regex';
+}
+#blog-content pre.language-markup::before {
+  content: 'HTML';
+}
+#blog-content pre.language-css::before {
+  content: 'CSS';
+}
+
+#blog-content pre code {
+  background: none;
+  border: 0;
+  padding: 0;
+  font-size: inherit;
+}
+
+#blog-content li code {
+  word-break: break-all;
+  white-space: break-spaces;
+  word-wrap: break-word;
+}
+
+#blog-content .blog-tip,
+#blog-content .blog-alert {
+  border: 1px solid black;
+  border-radius: 0.25rem;
+  padding: 1rem;
+}
+
+#blog-content .blog-alert {
+  background-color: rgba(255, 121, 251, 0.25);
+}
+
+#blog-content .blog-tip {
+  background-color: rgba(58, 212, 242, 0.45);
+}
+
+#blog-content .blog-tip p,
+#blog-content .blog-alert p {
+  margin: 0;
+  margin-left: 0.5rem;
+}
+
+#blog-content .tabs ul {
+  list-style-type: none;
+  display: flex;
+}
+
+/* PrismJS 1.29.0
+https://prismjs.com/download.html#themes=prism-tomorrow&languages=markup+css+clike+javascript+go */
+code[class*='language-'],
+pre[class*='language-'] {
+  color: #ccc;
+  font-family: monospace;
+  text-align: left;
+  white-space: pre;
+  word-spacing: normal;
+  word-break: normal;
+  word-wrap: normal;
+  line-height: 2;
+  tab-size: 4;
+  hyphens: none;
+  font-size: 1rem;
+}
+
+pre[class*='language-'] {
+  padding: 1em;
+  margin: 0.5em 0;
+  overflow: auto;
+}
+
+:not(pre) > code[class*='language-'],
+pre[class*='language-'] {
+  background-color: rgba(0, 0, 0, 0.5);
+}
+
+code {
+  font-size: inherit;
+  color: #67cdcc;
+}
+
+:not(pre) > code[class*='language-'] {
+  padding: 0.1em;
+  border-radius: 0.3em;
+  white-space: normal;
+}
+
+.token.block-comment,
+.token.cdata,
+.token.comment,
+.token.doctype,
+.token.prolog {
+  color: #999;
+}
+
+.token.punctuation {
+  color: #ccc;
+}
+
+.token.attr-name,
+.token.deleted,
+.token.namespace,
+.token.tag {
+  color: #e2777a;
+}
+
+.token.function-name {
+  color: #6196cc;
+}
+
+.token.boolean,
+.token.function,
+.token.number {
+  color: #f08d49;
+}
+
+.token.class-name,
+.token.constant,
+.token.property,
+.token.symbol {
+  color: #f8c555;
+}
+
+.token.atrule,
+.token.builtin,
+.token.important,
+.token.keyword,
+.token.selector {
+  color: #cc99cd;
+}
+
+.token.attr-value,
+.token.char,
+.token.regex,
+.token.string,
+.token.variable {
+  color: #7ec699;
+}
+
+.token.entity,
+.token.operator,
+.token.url {
+  color: #67cdcc;
+}
+.token.bold,
+.token.important {
+  font-weight: 700;
+}
+
+.token.italic {
+  font-style: italic;
+}
+
+.token.entity {
+  cursor: help;
+}
+
+.token.inserted {
+  color: green;
+}

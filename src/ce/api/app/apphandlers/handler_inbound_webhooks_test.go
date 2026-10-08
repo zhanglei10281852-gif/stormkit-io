@@ -1,0 +1,405 @@
+package apphandlers_test
+
+import (
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/suite"
+	"gopkg.in/guregu/null.v3"
+
+	"github.com/stormkit-io/stormkit-io/src/ce/api/app"
+	"github.com/stormkit-io/stormkit-io/src/ce/api/app/apphandlers"
+	"github.com/stormkit-io/stormkit-io/src/ce/api/app/buildconf"
+	"github.com/stormkit-io/stormkit-io/src/lib/factory"
+	"github.com/stormkit-io/stormkit-io/src/lib/shttp"
+)
+
+// readTracker is a request body that records whether it has been read.
+type readTracker struct {
+	io.Reader
+	read bool
+}
+
+func (r *readTracker) Read(p []byte) (int, error) {
+	r.read = true
+
+	return r.Reader.Read(p)
+}
+
+// postWebhookParams represents the parameters for postWebhook.
+type postWebhookParams struct {
+	Target  string
+	Headers map[string]string
+}
+
+// postWebhook sends a webhook with a tracked body and returns the response
+// status and whether the body was read.
+func postWebhook(p postWebhookParams) (int, bool) {
+	body := &readTracker{Reader: strings.NewReader(`{"not":"parsed"}`)}
+	req := httptest.NewRequest(http.MethodPost, p.Target, body)
+
+	for key, value := range p.Headers {
+		req.Header.Set(key, value)
+	}
+
+	recorder := httptest.NewRecorder()
+	shttp.NewRouter().RegisterService(apphandlers.Services).Router().Handler().ServeHTTP(recorder, req)
+
+	return recorder.Code, body.read
+}
+
+type InboundWebhooksSuite struct {
+	suite.Suite
+	*factory.Factory
+
+	// conn databasetest.TestDB
+	list []*app.DeployCandidate
+}
+
+func (s *InboundWebhooksSuite) BeforeTest(suiteName, _ string) {
+	myApp := &app.MyApp{
+		App: &app.App{},
+	}
+
+	s.list = []*app.DeployCandidate{
+		{
+			MyApp:            myApp,
+			EnvName:          "development",
+			EnvDefaultBranch: "staging",
+		},
+		{
+			MyApp:            myApp,
+			EnvName:          "production",
+			EnvDefaultBranch: "master",
+		},
+		{
+			MyApp:            myApp,
+			EnvName:          "testing",
+			EnvDefaultBranch: "testing",
+		},
+		{
+			MyApp:              myApp,
+			EnvName:            "auto-deploy-branch",
+			EnvDefaultBranch:   "auto-deploys",
+			AutoDeployBranches: null.NewString("^(?!dependabot).+", true),
+		},
+	}
+}
+
+func (s *InboundWebhooksSuite) Test_TriggerDeploy() {
+	commitInput := apphandlers.TriggerDeployInput{
+		Repo:         "github/stormkit-io/sample-project",
+		CheckoutRepo: "github/stormkit-io/sample-project",
+		Branch:       "main",
+		Message:      "chore: use suggested method",
+		EventType:    "commit",
+	}
+
+	pullRequestInput := apphandlers.TriggerDeployInput{
+		Repo:              "github/stormkit-io/sample-project",
+		CheckoutRepo:      "github/stormkit-io/sample-project",
+		IsFork:            false,
+		Branch:            "example-pr",
+		Message:           "chore: example pr",
+		EventType:         "pull_request",
+		PullRequestNumber: 2,
+	}
+
+	// TODO: Create real tests from these inputs
+	s.NotEmpty(pullRequestInput)
+	s.NotEmpty(commitInput)
+}
+
+func (s *InboundWebhooksSuite) Test_MatchPattern() {
+	a := assert.New(s.T())
+	a.True(apphandlers.MatchPattern("^dependabot/.*", "dependabot/bump-node-forge-1.4.5"))
+	a.True(apphandlers.MatchPattern("^(dependabot|renovate)/.*", "dependabot/bump-node-forge-1.4.5"))
+	a.True(apphandlers.MatchPattern("^(dependabot|renovate)/.*", "renovate/bump-node-forge-1.4.5"))
+	a.False(apphandlers.MatchPattern("^(?!dependabot|renovate).*/.*", "renovate/bump-node-forge-1.4.5"))
+	a.False(apphandlers.MatchPattern("^(?!dependabot|renovate).*/.*", "dependabot/bump-node-forge-1.4.5"))
+	a.False(apphandlers.MatchPattern("^(?!dependabot|renovate).*/.*", "release"))
+	a.True(apphandlers.MatchPattern("^(?!dependabot|renovate).*/.*", "release/staging"))
+	a.True(apphandlers.MatchPattern("^(?!dependabot).+", "auto-deploy-branches"))
+	a.True(apphandlers.MatchPattern("my-branch", "hello-my-branch"))
+	a.False(apphandlers.MatchPattern("^my-branch", "hello-my-branch"))
+	a.False(apphandlers.MatchPattern("my-branch", "my-b"))
+	a.True(apphandlers.MatchPattern("release-*", "release-staging"))
+	a.True(apphandlers.MatchPattern(`^chore\(release\):.+`, "chore(release): version 10.504.21"))
+	a.False(apphandlers.MatchPattern(`^chore(release):.+`, "chore(release): version 10.504.21"))
+	a.False(apphandlers.MatchPattern(`\[deploy\]`, "chore: remove env variable"))
+	a.True(apphandlers.MatchPattern(`\[deploy\]`, "chore: remove env variable [deploy]"))
+}
+
+func (s *InboundWebhooksSuite) Test_FilterDeployCandidates_AutoDeploy() {
+	s.list[0].AutoDeployBranches = null.NewString("some-regex", true)
+	s.list[1].AutoDeployBranches = null.NewString("some-other-regex", true)
+	s.list[2].AutoDeployBranches = null.NewString("another-regex", true)
+	s.list[3].AutoDeployBranches = null.NewString("", false)
+
+	c := apphandlers.FilterDeployCandidates(apphandlers.TriggerDeployInput{
+		Branch: "staging",
+	}, s.list)
+
+	s.Len(c, 2)
+	s.Equal("development", c[0].EnvName)
+	s.Equal("auto-deploy-branch", c[1].EnvName)
+
+	c = apphandlers.FilterDeployCandidates(apphandlers.TriggerDeployInput{
+		Branch: "master",
+	}, s.list)
+
+	s.Len(c, 2)
+	s.Equal("production", c[0].EnvName)
+	s.Equal("master", c[0].EnvDefaultBranch)
+	s.Equal("auto-deploy-branch", c[1].EnvName)
+	s.Equal("", c[1].AutoDeployBranches.ValueOrZero())
+
+	c = apphandlers.FilterDeployCandidates(apphandlers.TriggerDeployInput{
+		Branch:            "feature-branch",
+		PullRequestNumber: 201,
+	}, s.list)
+
+	s.Equal("auto-deploy-branch", c[0].EnvName)
+	s.Len(c, 1)
+}
+
+func (s *InboundWebhooksSuite) Test_FilterDeployCandidates_AutoDeployBranchesConfig() {
+	myApp := &app.MyApp{
+		App: &app.App{},
+	}
+
+	list := []*app.DeployCandidate{
+		{
+			MyApp:              myApp,
+			EnvName:            "development",
+			EnvDefaultBranch:   "staging",
+			AutoDeployBranches: null.NewString("branch-1-*", true),
+		},
+		{
+			MyApp:              myApp,
+			EnvName:            "production",
+			EnvDefaultBranch:   "master",
+			AutoDeployBranches: null.NewString("branch-2-*", true),
+		},
+		{
+			MyApp:              myApp,
+			EnvName:            "testing",
+			EnvDefaultBranch:   "testing",
+			AutoDeployBranches: null.NewString("branch-*", true),
+		},
+	}
+
+	c := apphandlers.FilterDeployCandidates(apphandlers.TriggerDeployInput{
+		Branch: "staging",
+	}, list)
+
+	s.Equal("development", c[0].EnvName)
+	s.Len(c, 1)
+
+	c = apphandlers.FilterDeployCandidates(apphandlers.TriggerDeployInput{
+		Branch:            "branch-1-a",
+		PullRequestNumber: 201,
+	}, list)
+
+	s.Len(c, 2)
+	s.Equal("development", c[0].EnvName)
+	s.Equal("testing", c[1].EnvName)
+
+	c = apphandlers.FilterDeployCandidates(apphandlers.TriggerDeployInput{
+		Branch:            "branch-3",
+		PullRequestNumber: 201,
+	}, list)
+
+	s.Equal("testing", c[0].EnvName)
+	s.Len(c, 1)
+}
+
+func (s *InboundWebhooksSuite) Test_FilterDeployCandidates_AutoDeployCommitsConfig() {
+	myApp := &app.MyApp{
+		App: &app.App{},
+	}
+
+	list := []*app.DeployCandidate{
+		{
+			MyApp:             myApp,
+			EnvName:           "development",
+			EnvDefaultBranch:  "staging",
+			AutoDeployCommits: null.NewString("release:*", true),
+		},
+		{
+			MyApp:             myApp,
+			EnvName:           "development-2",
+			EnvDefaultBranch:  "staging",
+			AutoDeployCommits: null.NewString("something-else:*", true),
+		},
+	}
+
+	// The commit should only be checked if the branches match
+	c := apphandlers.FilterDeployCandidates(apphandlers.TriggerDeployInput{
+		Message: "release: hello world",
+		Branch:  "staging",
+	}, list)
+
+	s.Equal("development", c[0].EnvName)
+	s.Len(c, 1)
+
+	// The commit should not be checked if branches do not match
+	c = apphandlers.FilterDeployCandidates(apphandlers.TriggerDeployInput{
+		Message: "release: hello world",
+		Branch:  "some-random-branch",
+	}, list)
+
+	s.Len(c, 0)
+}
+
+func (s *InboundWebhooksSuite) buildRootList() []*app.DeployCandidate {
+	myApp := &app.MyApp{
+		App: &app.App{},
+	}
+
+	return []*app.DeployCandidate{
+		{
+			MyApp:            myApp,
+			EnvName:          "infrastructure",
+			EnvDefaultBranch: "main",
+			BuildConfig: &buildconf.BuildConf{
+				WorkDir:                "/apps/infrastructure/",
+				SkipUnchangedBuildRoot: null.BoolFrom(true),
+			},
+		},
+		{
+			MyApp:            myApp,
+			EnvName:          "frontend",
+			EnvDefaultBranch: "main",
+			BuildConfig: &buildconf.BuildConf{
+				WorkDir:                "apps/frontend",
+				WatchPaths:             []string{"packages/ui"},
+				SkipUnchangedBuildRoot: null.BoolFrom(true),
+			},
+		},
+		{
+			MyApp:            myApp,
+			EnvName:          "repository-root",
+			EnvDefaultBranch: "main",
+			BuildConfig: &buildconf.BuildConf{
+				SkipUnchangedBuildRoot: null.BoolFrom(true),
+			},
+		},
+	}
+}
+
+func (s *InboundWebhooksSuite) Test_FilterDeployCandidates_BuildRootChanged() {
+	list := s.buildRootList()
+
+	input := apphandlers.TriggerDeployInput{
+		Branch:          "main",
+		ChangedFiles:    []string{"apps/infrastructure/main.tf"},
+		ChangesComplete: true,
+	}
+
+	candidates := apphandlers.FilterDeployCandidates(input, list)
+
+	s.Len(candidates, 2)
+	s.Equal("infrastructure", candidates[0].EnvName)
+	s.Equal("repository-root", candidates[1].EnvName)
+
+	input.ChangedFiles = []string{"package-lock.json"}
+	candidates = apphandlers.FilterDeployCandidates(input, list)
+
+	s.Len(candidates, 3)
+
+	input.ChangedFiles = []string{"apps/infrastructure-docs/readme.md"}
+	candidates = apphandlers.FilterDeployCandidates(input, list)
+
+	s.Len(candidates, 1)
+	s.Equal("repository-root", candidates[0].EnvName)
+
+	input.ChangesComplete = false
+	candidates = apphandlers.FilterDeployCandidates(input, list)
+
+	s.Len(candidates, 3)
+}
+
+// Path filtering is opt-in: an environment that has a build root but has not
+// enabled the filter keeps deploying on every push.
+func (s *InboundWebhooksSuite) Test_FilterDeployCandidates_BuildRootFilterIsOptIn() {
+	list := s.buildRootList()
+
+	for _, dc := range list {
+		dc.BuildConfig.SkipUnchangedBuildRoot = null.Bool{}
+	}
+
+	candidates := apphandlers.FilterDeployCandidates(apphandlers.TriggerDeployInput{
+		Branch:          "main",
+		ChangedFiles:    []string{"apps/infrastructure/main.tf"},
+		ChangesComplete: true,
+	}, list)
+
+	s.Len(candidates, 3)
+}
+
+// Shared workspace packages live outside the build root, so a change to one of
+// them has to keep the environments that watch it.
+func (s *InboundWebhooksSuite) Test_FilterDeployCandidates_WatchPaths() {
+	list := s.buildRootList()
+
+	candidates := apphandlers.FilterDeployCandidates(apphandlers.TriggerDeployInput{
+		Branch:          "main",
+		ChangedFiles:    []string{"packages/ui/button.tsx"},
+		ChangesComplete: true,
+	}, list)
+
+	s.Len(candidates, 2)
+	s.Equal("frontend", candidates[0].EnvName)
+	s.Equal("repository-root", candidates[1].EnvName)
+
+	// A sibling directory sharing the prefix must not match.
+	candidates = apphandlers.FilterDeployCandidates(apphandlers.TriggerDeployInput{
+		Branch:          "main",
+		ChangedFiles:    []string{"packages/ui-legacy/button.tsx"},
+		ChangesComplete: true,
+	}, list)
+
+	s.Len(candidates, 1)
+	s.Equal("repository-root", candidates[0].EnvName)
+}
+
+// Watch paths are additive. An environment building from the repository root
+// is affected by every change, so adding a watch path must not start filtering
+// out the directories it used to deploy on.
+func (s *InboundWebhooksSuite) Test_FilterDeployCandidates_RepoRootBuildRootIgnoresWatchPaths() {
+	myApp := &app.MyApp{
+		App: &app.App{},
+	}
+
+	for _, workDir := range []string{"", "./", "/", "."} {
+		list := []*app.DeployCandidate{
+			{
+				MyApp:            myApp,
+				EnvName:          "root",
+				EnvDefaultBranch: "main",
+				BuildConfig: &buildconf.BuildConf{
+					WorkDir:                workDir,
+					WatchPaths:             []string{"packages/ui"},
+					SkipUnchangedBuildRoot: null.BoolFrom(true),
+				},
+			},
+		}
+
+		candidates := apphandlers.FilterDeployCandidates(apphandlers.TriggerDeployInput{
+			Branch:          "main",
+			ChangedFiles:    []string{"apps/unrelated/main.go"},
+			ChangesComplete: true,
+		}, list)
+
+		s.Len(candidates, 1, "workDir %q must keep deploying on every change", workDir)
+	}
+}
+
+func TestIncomingWebhooks(t *testing.T) {
+	suite.Run(t, &InboundWebhooksSuite{})
+}

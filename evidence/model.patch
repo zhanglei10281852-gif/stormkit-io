@@ -1,0 +1,1623 @@
+diff --git a/docs/deployments/4-outbound-webhooks.md b/docs/deployments/4-outbound-webhooks.md
+index cd84ba3..963eb63 100644
+--- a/docs/deployments/4-outbound-webhooks.md
++++ b/docs/deployments/4-outbound-webhooks.md
+@@ -56,8 +56,8 @@ When the `Request method` is selected as `Post`, you can specify the request pay
+ 
+ | Variable                       | Description                                                                                                                                                                                                                              |
+ | ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+-| `$SK_NOW`                      | An ISO 8601 formatted time string. The time is computed when sending the webhook.                                                                                                                                                        |
+-| `$SK_NOW_UNIX`                 | The unix timestamp. The time is computed when sending the webhook.                                                                                                                                                                       |
++| `$SK_NOW`                      | An ISO 8601 formatted time string. For deployment completion events the time is computed when the event is created and frozen for every retry; otherwise when sending the webhook.                                                        |
++| `$SK_NOW_UNIX`                 | The unix timestamp. For deployment completion events the time is computed when the event is created and frozen for every retry; otherwise when sending the webhook.                                                                       |
+ | `$SK_APP_ID`                   | The application id.                                                                                                                                                                                                                      |
+ | `$SK_ENVIRONMENT`              | The environment name. When triggering an outbound webhook on publish, this is the name of the environment that the deployment is published to. Otherwise, it is the name of the environment which the build configuration is taken from. |
+ | `$SK_DEPLOYMENT_ID`            | The deployment id.                                                                                                                                                                                                                       |
+@@ -67,6 +67,21 @@ When the `Request method` is selected as `Post`, you can specify the request pay
+ 
+ </section>
+ 
++## Delivery guarantees
++
++<section>
++
++Deployment completion events (the first two triggers above) are delivered reliably:
++
++- When a deployment completes, Stormkit freezes the request URL, headers and the rendered payload, including the expanded `$SK_*` variables. Editing or deleting the webhook afterwards does not change what a retry sends.
++- Network errors, timeouts, `429` and `5xx` responses are retried with exponential backoff (30 seconds, doubling up to 30 minutes, up to 12 attempts). A `Retry-After` header on `429` responses is honored. Records interrupted by a process restart are automatically reclaimed.
++- Explicit `4xx` rejections (other than `429`) are not retried; the failure reason is stored on the delivery record.
++- Every attempt of the same event carries a stable `X-Stormkit-Delivery-Id` header. Use it as an idempotency key on your side to ensure a retried event never causes a second side effect.
++
++Delivery failures never block the deployment itself, status checks, pull request previews or Discord notifications.
++
++</section>
++
+ ## Examples
+ 
+ ### Receive an Email Notification when a deployment fails
+diff --git a/src/ce/api/app/app_outbound_webhook_delivery_model.go b/src/ce/api/app/app_outbound_webhook_delivery_model.go
+new file mode 100644
+index 0000000..942c453
+--- /dev/null
++++ b/src/ce/api/app/app_outbound_webhook_delivery_model.go
+@@ -0,0 +1,89 @@
++package app
++
++import (
++	"time"
++
++	"github.com/stormkit-io/stormkit-io/src/lib/types"
++	null "gopkg.in/guregu/null.v3"
++)
++
++// Delivery lifecycle states.
++const (
++	// DeliveryStatusPending waits for its first or its next scheduled attempt.
++	DeliveryStatusPending = "pending"
++
++	// DeliveryStatusSending was claimed by a worker and is in flight.
++	// Rows left in this state past the stale threshold are safely reclaimed.
++	DeliveryStatusSending = "sending"
++
++	// DeliveryStatusSucceeded is a terminal state reached on a 2xx response.
++	DeliveryStatusSucceeded = "succeeded"
++
++	// DeliveryStatusFailed is a terminal state reached on a permanent rejection
++	// (e.g. 4xx other than 429) or after the attempt budget is exhausted.
++	DeliveryStatusFailed = "failed"
++)
++
++const (
++	// DeliveryMaxAttempts is the default attempt budget for one frozen event.
++	DeliveryMaxAttempts = 12
++
++	// DeliveryIDHeader carries the stable delivery identifier on every attempt,
++	// including retries. Receivers can use it as an idempotency key so a retried
++	// completion event never causes a second external side effect.
++	DeliveryIDHeader = "X-Stormkit-Delivery-Id"
++)
++
++// OutboundWebhookDelivery is a frozen, persistently tracked delivery of a
++// deployment completion outbound webhook (on_deploy_success /
++// on_deploy_failed). The request URL, method, headers and rendered body are
++// snapshots taken when the completion event is produced, so later edits to the
++// webhook configuration never change what a retry sends.
++type OutboundWebhookDelivery struct {
++	DeliveryID     types.ID
++	AppID          types.ID
++	DeploymentID   types.ID
++	WebhookID      types.ID
++	TriggerWhen    string
++	RequestURL     string
++	RequestMethod  string
++	RequestHeaders map[string]string
++	RequestBody    string
++	Status         string
++	Attempts       int
++	MaxAttempts    int
++	LastError      null.String
++	ResponseStatus null.Int
++	ResponseBody   null.String
++	NextAttemptAt  time.Time
++	LockedAt       null.Time
++	LastAttemptAt  null.Time
++	SucceededAt    null.Time
++	CreatedAt      time.Time
++	UpdatedAt      time.Time
++}
++
++// NewOutboundWebhookDelivery freezes the webhook configuration and renders the
++// payload for a deployment completion event. The rendered body (including the
++// expanded $SK_* variables) is frozen as well, so retries send exactly what
++// the first attempt sent.
++func NewOutboundWebhookDelivery(wh OutboundWebhook, settings OutboundWebhookSettings) *OutboundWebhookDelivery {
++	headers := make(map[string]string, len(wh.RequestHeaders))
++
++	for key, value := range wh.RequestHeaders {
++		headers[key] = value
++	}
++
++	return &OutboundWebhookDelivery{
++		AppID:          settings.AppID,
++		DeploymentID:   settings.DeploymentID,
++		WebhookID:      wh.WebhookID,
++		TriggerWhen:    wh.TriggerWhen,
++		RequestURL:     wh.RequestURL,
++		RequestMethod:  wh.RequestMethod,
++		RequestHeaders: headers,
++		RequestBody:    wh.RenderPayload(settings),
++		Status:         DeliveryStatusPending,
++		MaxAttempts:    DeliveryMaxAttempts,
++	}
++}
+diff --git a/src/ce/api/app/app_outbound_webhook_model.go b/src/ce/api/app/app_outbound_webhook_model.go
+index 9dba43d..9e7f6c1 100644
+--- a/src/ce/api/app/app_outbound_webhook_model.go
++++ b/src/ce/api/app/app_outbound_webhook_model.go
+@@ -58,50 +58,63 @@ func (wh OutboundWebhook) TriggerOnCachePurge() bool {
+ 	return wh.TriggerWhen == TriggerOnCachePurge
+ }
+ 
+-// Dispatch an outbound webhook
+-func (wh OutboundWebhook) Dispatch(settings OutboundWebhookSettings) DispatchOutput {
+-	req := shttp.NewRequestV2(wh.RequestMethod, wh.RequestURL)
+-	req.Headers(shttp.HeadersFromMap(wh.RequestHeaders))
++// RenderPayload expands the $SK_* template variables in the configured request
++// body and returns the result. An empty string is returned when no body is
++// configured. The timestamp variables are evaluated once per call.
++func (wh OutboundWebhook) RenderPayload(settings OutboundWebhookSettings) string {
++	payload := wh.RequestPayload.ValueOrZero()
++
++	if payload == "" {
++		return ""
++	}
+ 
+-	if wh.RequestPayload.ValueOrZero() != "" {
+-		payload := wh.RequestPayload.ValueOrZero()
+-		patterns := map[string]string{
+-			"$SK_NOW":      time.Now().Format(time.RFC3339),
+-			"$SK_NOW_UNIX": fmt.Sprintf("%d", time.Now().Unix()),
+-		}
++	now := time.Now()
++	patterns := map[string]string{
++		"$SK_NOW":      now.Format(time.RFC3339),
++		"$SK_NOW_UNIX": fmt.Sprintf("%d", now.Unix()),
++	}
+ 
+-		if appID := settings.AppID.String(); appID != "" {
+-			patterns["$SK_APP_ID"] = appID
+-		}
++	if appID := settings.AppID.String(); appID != "" {
++		patterns["$SK_APP_ID"] = appID
++	}
+ 
+-		if did := settings.DeploymentID.String(); did != "" {
+-			patterns["$SK_DEPLOYMENT_ID"] = did
+-		}
++	if did := settings.DeploymentID.String(); did != "" {
++		patterns["$SK_DEPLOYMENT_ID"] = did
++	}
+ 
+-		if ep := settings.DeploymentEndpoint; ep != "" {
+-			patterns["$SK_DEPLOYMENT_ENDPOINT"] = ep
+-		}
++	if ep := settings.DeploymentEndpoint; ep != "" {
++		patterns["$SK_DEPLOYMENT_ENDPOINT"] = ep
++	}
+ 
+-		if ep := settings.DeploymentLogsEndpoint; ep != "" {
+-			patterns["$SK_DEPLOYMENT_LOGS_ENDPOINT"] = ep
+-		}
++	if ep := settings.DeploymentLogsEndpoint; ep != "" {
++		patterns["$SK_DEPLOYMENT_LOGS_ENDPOINT"] = ep
++	}
+ 
+-		if status := settings.DeploymentStatus; status != "" {
+-			patterns["$SK_DEPLOYMENT_STATUS"] = status
+-		}
++	if status := settings.DeploymentStatus; status != "" {
++		patterns["$SK_DEPLOYMENT_STATUS"] = status
++	}
+ 
+-		if err := settings.DeploymentError; err != "" {
+-			patterns["$SK_DEPLOYMENT_ERROR"] = err
+-		}
++	if err := settings.DeploymentError; err != "" {
++		patterns["$SK_DEPLOYMENT_ERROR"] = err
++	}
++
++	if env := settings.EnvironmentName; env != "" {
++		patterns["$SK_ENVIRONMENT"] = env
++	}
++
++	for key, value := range patterns {
++		payload = strings.Replace(payload, key, value, -1)
++	}
+ 
+-		if env := settings.EnvironmentName; env != "" {
+-			patterns["$SK_ENVIRONMENT"] = env
+-		}
++	return payload
++}
+ 
+-		for key, value := range patterns {
+-			payload = strings.Replace(payload, key, value, -1)
+-		}
++// Dispatch an outbound webhook
++func (wh OutboundWebhook) Dispatch(settings OutboundWebhookSettings) DispatchOutput {
++	req := shttp.NewRequestV2(wh.RequestMethod, wh.RequestURL)
++	req.Headers(shttp.HeadersFromMap(wh.RequestHeaders))
+ 
++	if payload := wh.RenderPayload(settings); payload != "" {
+ 		req.Payload(payload)
+ 	}
+ 
+diff --git a/src/ce/api/app/deploy/deployhandlers/handler_deploy_callback.go b/src/ce/api/app/deploy/deployhandlers/handler_deploy_callback.go
+index 01982bb..7f8cf80 100644
+--- a/src/ce/api/app/deploy/deployhandlers/handler_deploy_callback.go
++++ b/src/ce/api/app/deploy/deployhandlers/handler_deploy_callback.go
+@@ -166,7 +166,6 @@ func UpdateCommit(req *shttp.RequestContext, data deployCallbackRequest) *shttp.
+ 
+ // UpdateExit updates the deployment exit code and handles post-deployment tasks.
+ func UpdateExit(req *shttp.RequestContext, data deployCallbackRequest) *shttp.Response {
+-	// TODO: Retry job perhaps?
+ 	if data.UploadError != "" {
+ 		data.deployment.Error = null.NewString(
+ 			fmt.Sprintf("Error: %s", data.UploadError),
+diff --git a/src/ce/api/app/deploy/deployhooks/hooks.go b/src/ce/api/app/deploy/deployhooks/hooks.go
+index 2c7bb02..f2f3219 100644
+--- a/src/ce/api/app/deploy/deployhooks/hooks.go
++++ b/src/ce/api/app/deploy/deployhooks/hooks.go
+@@ -51,13 +51,26 @@ var Exec = func(ctx context.Context, d *deploy.Deployment) {
+ 		DeploymentEndpoint:     cnf.PreviewURL(d.DisplayName, d.ID.String()),
+ 	}
+ 
++	// Freeze one delivery event per matching trigger. The request URL, headers
++	// and rendered payload are snapshotted now, so configuration changes after
++	// this point never alter retries. The events are delivered asynchronously
++	// with persistent retries; failures never block the notifications below.
++	events := []app.OutboundWebhookDelivery{}
++
+ 	for _, wh := range whs {
+-		if status == "success" && wh.TriggerOnDeploySuccess() {
+-			wh.Dispatch(args)
++		if (status == "success" && wh.TriggerOnDeploySuccess()) ||
++			(status == "failed" && wh.TriggerOnDeployFailed()) {
++			events = append(events, *app.NewOutboundWebhookDelivery(wh, args))
+ 		}
++	}
++
++	if len(events) > 0 {
++		inserted, err := NewStore().EnqueueOutboundWebhookDeliveries(ctx, events)
+ 
+-		if status == "failed" && wh.TriggerOnDeployFailed() {
+-			wh.Dispatch(args)
++		if err != nil {
++			slog.Errorf("failed while enqueueing outbound webhook deliveries: %v", err)
++		} else if inserted > 0 {
++			TriggerDeliveries()
+ 		}
+ 	}
+ 
+diff --git a/src/ce/api/app/deploy/deployhooks/hooks_deliveries.go b/src/ce/api/app/deploy/deployhooks/hooks_deliveries.go
+new file mode 100644
+index 0000000..3831d49
+--- /dev/null
++++ b/src/ce/api/app/deploy/deployhooks/hooks_deliveries.go
+@@ -0,0 +1,459 @@
++package deployhooks
++
++import (
++	"context"
++	"database/sql"
++	"encoding/json"
++	"fmt"
++	"io"
++	"math"
++	"net/http"
++	"strconv"
++	"strings"
++	"sync/atomic"
++	"time"
++
++	"github.com/stormkit-io/stormkit-io/src/ce/api/app"
++	"github.com/stormkit-io/stormkit-io/src/lib/shttp"
++	"github.com/stormkit-io/stormkit-io/src/lib/slog"
++	"github.com/stormkit-io/stormkit-io/src/lib/types"
++	null "gopkg.in/guregu/null.v3"
++)
++
++const (
++	// deliveryClaimBatchSize bounds how many rows one processing pass claims.
++	deliveryClaimBatchSize = 50
++
++	// deliveryRequestTimeout bounds a single HTTP attempt so a hanging target
++	// cannot hold a delivery row in the sending state indefinitely.
++	deliveryRequestTimeout = 15 * time.Second
++
++	// deliveryStaleThreshold is how long a row may stay in the sending state
++	// before another worker assumes the previous process crashed or restarted
++	// mid-flight and safely reclaims it.
++	deliveryStaleThreshold = 5 * time.Minute
++
++	// deliveryBackoffBase/deliveryBackoffMax define the exponential backoff
++	// used for retryable failures (network errors, timeouts, 429, 5xx).
++	deliveryBackoffBase = 30 * time.Second
++	deliveryBackoffMax  = 30 * time.Minute
++
++	// deliveryMaxBodyLength keeps response bodies bounded when persisted.
++	deliveryMaxBodyLength = 4096
++)
++
++// deliveryInFlight ensures a single background processing loop runs per
++// process, even when several deployments complete at the same time.
++var deliveryInFlight atomic.Bool
++
++// TriggerDeliveries kicks off asynchronous processing of due deliveries. It
++// never blocks the caller: deployment status transitions, status checks, pull
++// request previews and Discord notifications proceed even when a webhook
++// target is slow or unreachable. It is a variable so tests can replace it
++// with a synchronous implementation.
++var TriggerDeliveries = func() {
++	if !deliveryInFlight.CompareAndSwap(false, true) {
++		return
++	}
++
++	go func() {
++		defer deliveryInFlight.Store(false)
++
++		if err := ProcessDueDeliveries(context.Background()); err != nil {
++			slog.Errorf("error while processing outbound webhook deliveries: %s", err.Error())
++		}
++	}()
++}
++
++// ProcessDueDeliveries claims due (or stale) deliveries and performs their HTTP
++// attempt, persisting the outcome of each one. It returns once there are no
++// more due deliveries. It is invoked both just after events are enqueued and by
++// the periodic worker job, which is also the recovery path after timeouts and
++// process restarts.
++func ProcessDueDeliveries(ctx context.Context) error {
++	store := NewStore()
++
++	for {
++		if err := ctx.Err(); err != nil {
++			return err
++		}
++
++		deliveries, err := store.ClaimDueOutboundWebhookDeliveries(ctx, deliveryClaimBatchSize, deliveryStaleThreshold)
++
++		if err != nil {
++			return err
++		}
++
++		for i := range deliveries {
++			deliver(ctx, store, deliveries[i])
++		}
++
++		if len(deliveries) < deliveryClaimBatchSize {
++			return nil
++		}
++	}
++}
++
++// deliveryAttemptResult is the classified outcome of one HTTP attempt.
++type deliveryAttemptResult struct {
++	// status is the received HTTP status code, or zero when no response was
++	// received (network error, timeout or unreadable response).
++	status int
++
++	// body is the truncated response body.
++	body string
++
++	// error is the transport error message, empty when a response arrived.
++	error string
++
++	// retryAfter is the raw Retry-After header of a 429 response.
++	retryAfter string
++}
++
++// deliver performs a single attempt and advances the delivery state machine.
++func deliver(ctx context.Context, store *Store, d app.OutboundWebhookDelivery) {
++	result := sendDelivery(d)
++
++	responseStatus := null.NewInt(0, false)
++	responseBody := null.NewString("", false)
++
++	if result.status != 0 {
++		responseStatus = null.IntFrom(int64(result.status))
++		responseBody = null.StringFrom(result.body)
++	}
++
++	switch {
++	case result.status >= 200 && result.status < 300:
++		if err := store.MarkOutboundWebhookDeliverySucceeded(ctx, d.DeliveryID, d.Attempts, result.status, result.body); err != nil {
++			slog.Errorf("error while marking webhook delivery %d succeeded: %s", d.DeliveryID, err.Error())
++		}
++
++	case isPermanentDeliveryError(result):
++		reason := fmt.Sprintf("delivery failed permanently with HTTP status %d", result.status)
++
++		if result.body != "" {
++			reason = fmt.Sprintf("%s: %s", reason, result.body)
++		}
++
++		if err := store.MarkOutboundWebhookDeliveryFailed(ctx, d.DeliveryID, d.Attempts, reason, responseStatus, responseBody); err != nil {
++			slog.Errorf("error while marking webhook delivery %d failed: %s", d.DeliveryID, err.Error())
++		}
++
++	default:
++		// Retryable: no response (network error/timeout), 429 or 5xx.
++		reason := result.error
++
++		if reason == "" {
++			reason = fmt.Sprintf("delivery failed with retryable HTTP status %d", result.status)
++		}
++
++		if d.Attempts >= d.MaxAttempts {
++			exhausted := fmt.Sprintf("max delivery attempts (%d) exceeded: %s", d.MaxAttempts, reason)
++
++			if err := store.MarkOutboundWebhookDeliveryFailed(ctx, d.DeliveryID, d.Attempts, exhausted, responseStatus, responseBody); err != nil {
++				slog.Errorf("error while marking webhook delivery %d failed: %s", d.DeliveryID, err.Error())
++			}
++
++			return
++		}
++
++		delay := deliveryBackoff(d.Attempts)
++
++		if result.status == http.StatusTooManyRequests {
++			if retryAfter, ok := parseRetryAfter(result.retryAfter); ok {
++				delay = retryAfter
++			}
++		}
++
++		nextAttemptAt := time.Now().Add(delay)
++
++		if err := store.MarkOutboundWebhookDeliveryRetry(ctx, d.DeliveryID, d.Attempts, reason, responseStatus, responseBody, nextAttemptAt); err != nil {
++			slog.Errorf("error while rescheduling webhook delivery %d: %s", d.DeliveryID, err.Error())
++		}
++	}
++}
++
++// sendDelivery performs the frozen HTTP request. A stable delivery identifier
++// header is attached so receivers can deduplicate retries of the same event.
++func sendDelivery(d app.OutboundWebhookDelivery) deliveryAttemptResult {
++	headers := shttp.HeadersFromMap(d.RequestHeaders)
++	headers.Set(app.DeliveryIDHeader, d.DeliveryID.String())
++
++	req := shttp.NewRequestV2(d.RequestMethod, d.RequestURL).
++		WithTimeout(deliveryRequestTimeout).
++		Headers(headers)
++
++	if d.RequestBody != "" {
++		req.Payload(d.RequestBody)
++	}
++
++	res, err := req.Do()
++
++	if err != nil {
++		return deliveryAttemptResult{error: err.Error()}
++	}
++
++	defer res.Body.Close()
++
++	body, err := io.ReadAll(res.Body)
++
++	if err != nil {
++		// Headers arrived but the body did not: do not acknowledge delivery.
++		return deliveryAttemptResult{error: err.Error()}
++	}
++
++	return deliveryAttemptResult{
++		status:     res.StatusCode,
++		body:       truncateDeliveryBody(string(body)),
++		retryAfter: res.Header.Get("Retry-After"),
++	}
++}
++
++// isPermanentDeliveryError reports whether the attempt must not be retried.
++// Network errors and timeouts (no response), 429 rate limiting and 5xx server
++// errors are recoverable; everything else with a response (notably explicit
++// 4xx rejections and exhausted redirects) is terminal.
++func isPermanentDeliveryError(result deliveryAttemptResult) bool {
++	if result.status == 0 {
++		return false
++	}
++
++	if result.status == http.StatusTooManyRequests {
++		return false
++	}
++
++	if result.status >= 500 {
++		return false
++	}
++
++	return true
++}
++
++// deliveryBackoff returns the delay before the attempt after the given
++// (1-based) attempt number: 30s, 1m, 2m, ... capped at 30m.
++func deliveryBackoff(attempt int) time.Duration {
++	if attempt < 1 {
++		attempt = 1
++	}
++
++	delay := float64(deliveryBackoffBase) * math.Pow(2, float64(attempt-1))
++
++	if delay > float64(deliveryBackoffMax) {
++		delay = float64(deliveryBackoffMax)
++	}
++
++	return time.Duration(delay)
++}
++
++// parseRetryAfter parses an RFC 9110 Retry-After header, either as a number of
++// seconds or an HTTP date. It is clamped to the backoff ceiling.
++func parseRetryAfter(value string) (time.Duration, bool) {
++	value = strings.TrimSpace(value)
++
++	if value == "" {
++		return 0, false
++	}
++
++	if seconds, err := strconv.Atoi(value); err == nil {
++		if seconds < 0 {
++			seconds = 0
++		}
++
++		delay := time.Duration(seconds) * time.Second
++
++		if delay > deliveryBackoffMax {
++			delay = deliveryBackoffMax
++		}
++
++		return delay, true
++	}
++
++	if when, err := http.ParseTime(value); err == nil {
++		delay := time.Until(when)
++
++		if delay < 0 {
++			delay = 0
++		}
++
++		if delay > deliveryBackoffMax {
++			delay = deliveryBackoffMax
++		}
++
++		return delay, true
++	}
++
++	return 0, false
++}
++
++func truncateDeliveryBody(body string) string {
++	if len(body) > deliveryMaxBodyLength {
++		return body[:deliveryMaxBodyLength]
++	}
++
++	return body
++}
++
++// rowScanner is satisfied by both *sql.Row and *sql.Rows.
++type rowScanner interface {
++	Scan(dest ...any) error
++}
++
++func scanOutboundWebhookDelivery(scanner rowScanner) (app.OutboundWebhookDelivery, error) {
++	var (
++		d       app.OutboundWebhookDelivery
++		headers []byte
++	)
++
++	err := scanner.Scan(
++		&d.DeliveryID, &d.AppID, &d.DeploymentID, &d.WebhookID, &d.TriggerWhen,
++		&d.RequestURL, &d.RequestMethod, &headers, &d.RequestBody,
++		&d.Status, &d.Attempts, &d.MaxAttempts,
++		&d.LastError, &d.ResponseStatus, &d.ResponseBody,
++		&d.NextAttemptAt, &d.LockedAt, &d.LastAttemptAt, &d.SucceededAt,
++		&d.CreatedAt, &d.UpdatedAt,
++	)
++
++	if err != nil {
++		return d, err
++	}
++
++	d.RequestHeaders = map[string]string{}
++
++	if len(headers) > 0 {
++		if err := json.Unmarshal(headers, &d.RequestHeaders); err != nil {
++			slog.Errorf("failed while unmarshaling webhook delivery headers: %s", err.Error())
++		}
++	}
++
++	return d, nil
++}
++
++// EnqueueOutboundWebhookDeliveries persists the frozen completion events. The
++// unique index on (deployment_id, wh_id) makes enqueueing idempotent: running
++// the completion path twice never creates a second event for the same
++// deployment and trigger. It returns the number of newly created rows.
++func (s *Store) EnqueueOutboundWebhookDeliveries(ctx context.Context, deliveries []app.OutboundWebhookDelivery) (int, error) {
++	inserted := 0
++
++	for _, d := range deliveries {
++		headers, err := json.Marshal(d.RequestHeaders)
++
++		if err != nil {
++			return inserted, err
++		}
++
++		result, err := s.Exec(ctx, stmt.insertOutboundWebhookDelivery,
++			d.AppID, d.DeploymentID, d.WebhookID, d.TriggerWhen,
++			d.RequestURL, d.RequestMethod, headers, d.RequestBody,
++			d.MaxAttempts,
++		)
++
++		if err != nil {
++			return inserted, err
++		}
++
++		if affected, err := result.RowsAffected(); err == nil {
++			inserted += int(affected)
++		}
++	}
++
++	return inserted, nil
++}
++
++// ClaimDueOutboundWebhookDeliveries atomically transitions due pending rows
++// (and stale sending rows older than staleThreshold) to the sending state and
++// returns them with an incremented attempt counter.
++func (s *Store) ClaimDueOutboundWebhookDeliveries(ctx context.Context, limit int, staleThreshold time.Duration) ([]app.OutboundWebhookDelivery, error) {
++	rows, err := s.Query(ctx, stmt.claimDueOutboundWebhookDeliveries, limit, time.Now().Add(-staleThreshold))
++
++	if err != nil {
++		return nil, err
++	}
++
++	defer rows.Close()
++
++	deliveries := []app.OutboundWebhookDelivery{}
++
++	for rows.Next() {
++		d, err := scanOutboundWebhookDelivery(rows)
++
++		if err != nil {
++			slog.Errorf("failed while scanning webhook delivery: %s", err.Error())
++			continue
++		}
++
++		deliveries = append(deliveries, d)
++	}
++
++	return deliveries, nil
++}
++
++// MarkOutboundWebhookDeliverySucceeded records a terminal 2xx acknowledgement.
++// The attempt guard ensures a late response from a reclaimed attempt cannot
++// overwrite newer state.
++func (s *Store) MarkOutboundWebhookDeliverySucceeded(ctx context.Context, deliveryID types.ID, attempt, statusCode int, body string) error {
++	_, err := s.Exec(ctx, stmt.markOutboundWebhookDeliverySucceeded, deliveryID, attempt, statusCode, body)
++	return err
++}
++
++// MarkOutboundWebhookDeliveryRetry returns the row to pending with the failure
++// reason and the next scheduled attempt.
++func (s *Store) MarkOutboundWebhookDeliveryRetry(ctx context.Context, deliveryID types.ID, attempt int, errMsg string, statusCode null.Int, body null.String, nextAttemptAt time.Time) error {
++	_, err := s.Exec(ctx, stmt.markOutboundWebhookDeliveryRetry, deliveryID, attempt, errMsg, statusCode, body, nextAttemptAt)
++	return err
++}
++
++// MarkOutboundWebhookDeliveryFailed records the terminal failure and preserves
++// its reason.
++func (s *Store) MarkOutboundWebhookDeliveryFailed(ctx context.Context, deliveryID types.ID, attempt int, reason string, statusCode null.Int, body null.String) error {
++	_, err := s.Exec(ctx, stmt.markOutboundWebhookDeliveryFailed, deliveryID, attempt, reason, statusCode, body)
++	return err
++}
++
++// OutboundWebhookDeliveries returns all delivery records for a deployment,
++// making the delivery outcome per deployment and trigger queryable.
++func (s *Store) OutboundWebhookDeliveries(ctx context.Context, deploymentID types.ID) ([]app.OutboundWebhookDelivery, error) {
++	rows, err := s.Query(ctx, stmt.selectOutboundWebhookDeliveries, deploymentID)
++
++	if err != nil {
++		return nil, err
++	}
++
++	defer rows.Close()
++
++	deliveries := []app.OutboundWebhookDelivery{}
++
++	for rows.Next() {
++		d, err := scanOutboundWebhookDelivery(rows)
++
++		if err != nil {
++			return nil, err
++		}
++
++		deliveries = append(deliveries, d)
++	}
++
++	return deliveries, nil
++}
++
++// OutboundWebhookDelivery returns the delivery record for one deployment and
++// trigger. It returns nil without error when no record exists.
++func (s *Store) OutboundWebhookDelivery(ctx context.Context, deploymentID, webhookID types.ID) (*app.OutboundWebhookDelivery, error) {
++	row, err := s.QueryRow(ctx, stmt.selectOutboundWebhookDeliveryByDeployment, deploymentID, webhookID)
++
++	if err != nil {
++		return nil, err
++	}
++
++	d, err := scanOutboundWebhookDelivery(row)
++
++	if err == sql.ErrNoRows {
++		return nil, nil
++	}
++
++	if err != nil {
++		return nil, err
++	}
++
++	return &d, nil
++}
+diff --git a/src/ce/api/app/deploy/deployhooks/hooks_deliveries_test.go b/src/ce/api/app/deploy/deployhooks/hooks_deliveries_test.go
+new file mode 100644
+index 0000000..f21288d
+--- /dev/null
++++ b/src/ce/api/app/deploy/deployhooks/hooks_deliveries_test.go
+@@ -0,0 +1,633 @@
++package deployhooks_test
++
++import (
++	"context"
++	"io"
++	"net/http"
++	"net/http/httptest"
++	"sync"
++	"testing"
++	"time"
++
++	"github.com/stormkit-io/stormkit-io/src/ce/api/app"
++	"github.com/stormkit-io/stormkit-io/src/ce/api/app/deploy"
++	"github.com/stormkit-io/stormkit-io/src/ce/api/app/deploy/deployhooks"
++	"github.com/stormkit-io/stormkit-io/src/lib/database/databasetest"
++	"github.com/stormkit-io/stormkit-io/src/lib/factory"
++	"github.com/stormkit-io/stormkit-io/src/lib/shttp"
++	"github.com/stormkit-io/stormkit-io/src/lib/types"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/suite"
++	null "gopkg.in/guregu/null.v3"
++)
++
++type HooksDeliveriesSuite struct {
++	suite.Suite
++	*factory.Factory
++
++	conn databasetest.TestDB
++}
++
++func (s *HooksDeliveriesSuite) BeforeTest(suiteName, _ string) {
++	s.conn = databasetest.InitTx(suiteName)
++	s.Factory = factory.New(s.conn)
++}
++
++func (s *HooksDeliveriesSuite) AfterTest(_, _ string) {
++	s.conn.CloseTx()
++}
++
++// fakeWebhookServer replies with firstStatus on the first call and with
++// laterStatus on every subsequent call, recording call count, bodies and the
++// delivery id headers it received.
++type fakeWebhookServer struct {
++	server       *httptest.Server
++	mu           sync.Mutex
++	calls        int
++	bodies       []string
++	deliveryIDs  []string
++	contentTypes []string
++
++	firstStatus int
++	laterStatus int
++	retryAfter  string
++}
++
++func newFakeWebhookServer(firstStatus, laterStatus int, retryAfter string) *fakeWebhookServer {
++	f := &fakeWebhookServer{
++		firstStatus: firstStatus,
++		laterStatus: laterStatus,
++		retryAfter:  retryAfter,
++	}
++
++	mux := http.NewServeMux()
++
++	mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
++		body, _ := io.ReadAll(req.Body)
++
++		f.mu.Lock()
++		f.calls++
++		f.bodies = append(f.bodies, string(body))
++		f.deliveryIDs = append(f.deliveryIDs, req.Header.Get(app.DeliveryIDHeader))
++		f.contentTypes = append(f.contentTypes, req.Header.Get("Content-Type"))
++
++		status := f.firstStatus
++
++		if f.calls > 1 {
++			status = f.laterStatus
++		}
++
++		if status == http.StatusTooManyRequests && f.retryAfter != "" {
++			w.Header().Set("Retry-After", f.retryAfter)
++		}
++
++		f.mu.Unlock()
++
++		w.WriteHeader(status)
++		_, _ = w.Write([]byte("response-body"))
++	})
++
++	f.server = httptest.NewServer(mux)
++
++	return f
++}
++
++func (f *fakeWebhookServer) URL() string {
++	return f.server.URL
++}
++
++func (f *fakeWebhookServer) Calls() int {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++
++	return f.calls
++}
++
++func (f *fakeWebhookServer) DeliveryIDs() []string {
++	f.mu.Lock()
++	defer f.mu.Unlock()
++
++	out := make([]string, len(f.deliveryIDs))
++	copy(out, f.deliveryIDs)
++
++	return out
++}
++
++func (f *fakeWebhookServer) Close() {
++	f.server.Close()
++}
++
++// processSynchronously replaces the asynchronous delivery trigger with a
++// synchronous implementation and returns a restore function.
++func (s *HooksDeliveriesSuite) processSynchronously() func() {
++	original := deployhooks.TriggerDeliveries
++	deployhooks.TriggerDeliveries = func() {
++		s.Require().NoError(deployhooks.ProcessDueDeliveries(context.Background()))
++	}
++
++	return func() {
++		deployhooks.TriggerDeliveries = original
++	}
++}
++
++// disableTrigger enqueues events without delivering them so the test can
++// manipulate the rows before driving processing manually.
++func (s *HooksDeliveriesSuite) disableTrigger() func() {
++	original := deployhooks.TriggerDeliveries
++	deployhooks.TriggerDeliveries = func() {}
++
++	return func() {
++		deployhooks.TriggerDeliveries = original
++	}
++}
++
++func (s *HooksDeliveriesSuite) insertWebhook(triggerWhen, url string, payload *string) types.ID {
++	body := null.String{}
++
++	if payload != nil {
++		body = null.StringFrom(*payload)
++	}
++
++	err := app.NewStore().InsertOutboundWebhook(context.Background(), s.GetApp().ID, app.OutboundWebhook{
++		TriggerWhen:    triggerWhen,
++		RequestURL:     url,
++		RequestMethod:  shttp.MethodPost,
++		RequestPayload: body,
++		RequestHeaders: map[string]string{"Content-Type": "application/json"},
++	})
++
++	s.Require().NoError(err)
++
++	var whID types.ID
++	err = s.conn.QueryRow(
++		`SELECT wh_id FROM app_outbound_webhooks WHERE app_id = $1 ORDER BY wh_id DESC LIMIT 1`,
++		s.GetApp().ID,
++	).Scan(&whID)
++
++	s.Require().NoError(err)
++
++	return whID
++}
++
++func (s *HooksDeliveriesSuite) delivery(deploymentID, webhookID types.ID) *app.OutboundWebhookDelivery {
++	d, err := deployhooks.NewStore().OutboundWebhookDelivery(context.Background(), deploymentID, webhookID)
++	s.Require().NoError(err)
++	s.Require().NotNil(d)
++
++	return d
++}
++
++func (s *HooksDeliveriesSuite) successfulDeployment() *factory.MockDeployment {
++	return s.MockDeployment(nil, map[string]interface{}{
++		"ExitCode":          null.NewInt(0, true),
++		"PullRequestNumber": null.NewInt(0, true),
++		"ShouldPublish":     true,
++	})
++}
++
++func (s *HooksDeliveriesSuite) failedDeployment() *factory.MockDeployment {
++	return s.MockDeployment(nil, map[string]interface{}{
++		"ExitCode":          null.NewInt(1, true),
++		"PullRequestNumber": null.NewInt(0, true),
++		"ShouldPublish":     false,
++		"Error":             null.StringFrom("build failed"),
++	})
++}
++
++func (s *HooksDeliveriesSuite) execCompletion(d *deploy.Deployment) {
++	deployhooks.Exec(context.Background(), d)
++}
++
++// Test_Success_FreezesPayloadAndTarget verifies that a successful deployment
++// delivers the webhook exactly once with the rendered payload and a stable
++// delivery id header, and records a succeeded delivery.
++func (s *HooksDeliveriesSuite) Test_Success_FreezesPayloadAndTarget() {
++	a := assert.New(s.T())
++	server := newFakeWebhookServer(http.StatusOK, http.StatusOK, "")
++	defer server.Close()
++
++	payload := `{"deployment_id":"$SK_DEPLOYMENT_ID","status":"$SK_DEPLOYMENT_STATUS"}`
++	whID := s.insertWebhook(app.TriggerOnDeploySuccess, server.URL(), &payload)
++
++	depl := s.successfulDeployment()
++
++	restore := s.processSynchronously()
++	defer restore()
++
++	s.execCompletion(&deploy.Deployment{
++		ID:       depl.ID,
++		Env:      "production",
++		Branch:   "master",
++		EnvID:    s.GetEnv().ID,
++		AppID:    s.GetApp().ID,
++		ExitCode: null.NewInt(0, true),
++	})
++
++	a.Equal(1, server.Calls())
++	a.JSONEq(`{"deployment_id":"1","status":"success"}`, server.bodies[0])
++	a.Equal([]string{"application/json"}, server.contentTypes)
++
++	d := s.delivery(depl.ID, whID)
++	a.Equal(app.DeliveryStatusSucceeded, d.Status)
++	a.Equal(1, d.Attempts)
++	a.Equal(int64(http.StatusOK), d.ResponseStatus.ValueOrZero())
++	a.JSONEq(`{"deployment_id":"1","status":"success"}`, d.RequestBody)
++	a.Equal(server.URL(), d.RequestURL)
++	a.Equal(shttp.MethodPost, d.RequestMethod)
++	a.True(d.SucceededAt.Valid)
++	a.Equal(d.DeliveryID.String(), server.DeliveryIDs()[0])
++}
++
++// Test_Idempotent_DuplicateCompletion verifies that running the completion
++// path twice still creates exactly one event and causes one external call.
++func (s *HooksDeliveriesSuite) Test_Idempotent_DuplicateCompletion() {
++	a := assert.New(s.T())
++	server := newFakeWebhookServer(http.StatusOK, http.StatusOK, "")
++	defer server.Close()
++
++	payload := `{"deployment_id":"$SK_DEPLOYMENT_ID"}`
++	whID := s.insertWebhook(app.TriggerOnDeploySuccess, server.URL(), &payload)
++	depl := s.successfulDeployment()
++
++	restore := s.processSynchronously()
++	defer restore()
++
++	completion := func() {
++		s.execCompletion(&deploy.Deployment{
++			ID:       depl.ID,
++			Env:      "production",
++			Branch:   "master",
++			EnvID:    s.GetEnv().ID,
++			AppID:    s.GetApp().ID,
++			ExitCode: null.NewInt(0, true),
++		})
++	}
++
++	completion()
++	completion()
++
++	a.Equal(1, server.Calls())
++
++	rows, err := deployhooks.NewStore().OutboundWebhookDeliveries(context.Background(), depl.ID)
++	s.Require().NoError(err)
++	a.Len(rows, 1)
++	a.Equal(1, rows[0].Attempts)
++	a.Equal(app.DeliveryStatusSucceeded, rows[0].Status)
++	a.Equal(whID, rows[0].WebhookID)
++	a.NotEmpty(server.DeliveryIDs()[0])
++	a.Equal(rows[0].DeliveryID.String(), server.DeliveryIDs()[0])
++}
++
++// Test_FailedDeployment_TriggersFailedWebhook verifies that a failed build
++// fires on_deploy_failed with the rendered failure payload.
++func (s *HooksDeliveriesSuite) Test_FailedDeployment_TriggersFailedWebhook() {
++	a := assert.New(s.T())
++	server := newFakeWebhookServer(http.StatusOK, http.StatusOK, "")
++	defer server.Close()
++
++	payload := `{"status":"$SK_DEPLOYMENT_STATUS","error":"$SK_DEPLOYMENT_ERROR"}`
++	whID := s.insertWebhook(app.TriggerOnDeployFailed, server.URL(), &payload)
++	depl := s.failedDeployment()
++
++	restore := s.processSynchronously()
++	defer restore()
++
++	s.execCompletion(&deploy.Deployment{
++		ID:       depl.ID,
++		Env:      "production",
++		Branch:   "master",
++		EnvID:    s.GetEnv().ID,
++		AppID:    s.GetApp().ID,
++		ExitCode: null.NewInt(1, true),
++		Error:    null.StringFrom("build failed"),
++	})
++
++	a.Equal(1, server.Calls())
++	a.JSONEq(`{"status":"failed","error":"build failed"}`, server.bodies[0])
++
++	d := s.delivery(depl.ID, whID)
++	a.Equal(app.DeliveryStatusSucceeded, d.Status)
++	a.JSONEq(`{"status":"failed","error":"build failed"}`, d.RequestBody)
++}
++
++// Test_Permanent4xx_Terminal verifies that an explicit 4xx rejection ends in
++// the failed terminal state, preserving the reason, and is never retried.
++func (s *HooksDeliveriesSuite) Test_Permanent4xx_Terminal() {
++	a := assert.New(s.T())
++	server := newFakeWebhookServer(http.StatusNotFound, http.StatusNotFound, "")
++	defer server.Close()
++
++	whID := s.insertWebhook(app.TriggerOnDeploySuccess, server.URL(), nil)
++	depl := s.successfulDeployment()
++
++	restore := s.processSynchronously()
++	defer restore()
++
++	s.execCompletion(&deploy.Deployment{
++		ID:       depl.ID,
++		Env:      "production",
++		Branch:   "master",
++		EnvID:    s.GetEnv().ID,
++		AppID:    s.GetApp().ID,
++		ExitCode: null.NewInt(0, true),
++	})
++
++	a.Equal(1, server.Calls())
++
++	d := s.delivery(depl.ID, whID)
++	a.Equal(app.DeliveryStatusFailed, d.Status)
++	a.Equal(1, d.Attempts)
++	a.Equal(int64(http.StatusNotFound), d.ResponseStatus.ValueOrZero())
++	a.Contains(d.LastError.String, "404")
++	a.Contains(d.LastError.String, "response-body")
++	a.False(d.SucceededAt.Valid)
++
++	// The worker must not pick terminal rows up again.
++	s.Require().NoError(deployhooks.ProcessDueDeliveries(context.Background()))
++	a.Equal(1, server.Calls())
++}
++
++// Test_5xx_RetriesWithBackoff verifies that a 5xx is retried on an exponential
++// schedule and succeeds once the target recovers.
++func (s *HooksDeliveriesSuite) Test_5xx_RetriesWithBackoff() {
++	a := assert.New(s.T())
++	server := newFakeWebhookServer(http.StatusServiceUnavailable, http.StatusOK, "")
++	defer server.Close()
++
++	whID := s.insertWebhook(app.TriggerOnDeploySuccess, server.URL(), nil)
++	depl := s.successfulDeployment()
++
++	restore := s.processSynchronously()
++	defer restore()
++
++	before := time.Now()
++
++	s.execCompletion(&deploy.Deployment{
++		ID:       depl.ID,
++		Env:      "production",
++		Branch:   "master",
++		EnvID:    s.GetEnv().ID,
++		AppID:    s.GetApp().ID,
++		ExitCode: null.NewInt(0, true),
++	})
++
++	a.Equal(1, server.Calls())
++
++	d := s.delivery(depl.ID, whID)
++	a.Equal(app.DeliveryStatusPending, d.Status)
++	a.Equal(1, d.Attempts)
++	a.Equal(int64(http.StatusServiceUnavailable), d.ResponseStatus.ValueOrZero())
++	a.Contains(d.LastError.String, "503")
++	a.True(d.NextAttemptAt.After(before.Add(20*time.Second)), "first backoff should be ~30s, got %v", d.NextAttemptAt.Sub(before))
++	a.True(d.NextAttemptAt.Before(before.Add(45 * time.Second)))
++
++	// Simulate the worker tick arriving after the backoff window.
++	_, err := s.conn.Exec(
++		`UPDATE deployment_outbound_webhook_deliveries SET next_attempt_at = NOW() - INTERVAL '1 minute' WHERE delivery_id = $1`,
++		d.DeliveryID,
++	)
++	s.Require().NoError(err)
++
++	s.Require().NoError(deployhooks.ProcessDueDeliveries(context.Background()))
++
++	a.Equal(2, server.Calls())
++
++	d = s.delivery(depl.ID, whID)
++	a.Equal(app.DeliveryStatusSucceeded, d.Status)
++	a.Equal(2, d.Attempts)
++	a.Equal(int64(http.StatusOK), d.ResponseStatus.ValueOrZero())
++
++	// Both attempts carry the same stable delivery id.
++	ids := server.DeliveryIDs()
++	a.Len(ids, 2)
++	a.Equal(ids[0], ids[1])
++}
++
++// Test_429_HonorsRetryAfter verifies that a 429 is retried and the Retry-After
++// header drives the next attempt delay.
++func (s *HooksDeliveriesSuite) Test_429_HonorsRetryAfter() {
++	a := assert.New(s.T())
++	server := newFakeWebhookServer(http.StatusTooManyRequests, http.StatusOK, "1")
++	defer server.Close()
++
++	whID := s.insertWebhook(app.TriggerOnDeploySuccess, server.URL(), nil)
++	depl := s.successfulDeployment()
++
++	restore := s.processSynchronously()
++	defer restore()
++
++	before := time.Now()
++
++	s.execCompletion(&deploy.Deployment{
++		ID:       depl.ID,
++		Env:      "production",
++		Branch:   "master",
++		EnvID:    s.GetEnv().ID,
++		AppID:    s.GetApp().ID,
++		ExitCode: null.NewInt(0, true),
++	})
++
++	d := s.delivery(depl.ID, whID)
++	a.Equal(app.DeliveryStatusPending, d.Status)
++	a.True(d.NextAttemptAt.Before(before.Add(3*time.Second)), "Retry-After: 1 should schedule ~1s out, got %v", d.NextAttemptAt.Sub(before))
++	a.True(d.NextAttemptAt.After(before.Add(-1 * time.Second)))
++	a.Equal(int64(http.StatusTooManyRequests), d.ResponseStatus.ValueOrZero())
++
++	_, err := s.conn.Exec(
++		`UPDATE deployment_outbound_webhook_deliveries SET next_attempt_at = NOW() - INTERVAL '1 minute' WHERE delivery_id = $1`,
++		d.DeliveryID,
++	)
++	s.Require().NoError(err)
++
++	s.Require().NoError(deployhooks.ProcessDueDeliveries(context.Background()))
++
++	a.Equal(2, server.Calls())
++	a.Equal(app.DeliveryStatusSucceeded, s.delivery(depl.ID, whID).Status)
++}
++
++// Test_StaleSending_Reclaimed verifies that a record stuck in the sending
++// state after a crash or restart is reclaimed and delivered.
++func (s *HooksDeliveriesSuite) Test_StaleSending_Reclaimed() {
++	a := assert.New(s.T())
++	server := newFakeWebhookServer(http.StatusOK, http.StatusOK, "")
++	defer server.Close()
++
++	whID := s.insertWebhook(app.TriggerOnDeploySuccess, server.URL(), nil)
++	depl := s.successfulDeployment()
++
++	restore := s.disableTrigger()
++	defer restore()
++
++	s.execCompletion(&deploy.Deployment{
++		ID:       depl.ID,
++		Env:      "production",
++		Branch:   "master",
++		EnvID:    s.GetEnv().ID,
++		AppID:    s.GetApp().ID,
++		ExitCode: null.NewInt(0, true),
++	})
++
++	a.Zero(server.Calls())
++
++	// Simulate a process that claimed the row and died mid-request.
++	_, err := s.conn.Exec(
++		`UPDATE deployment_outbound_webhook_deliveries
++			SET status = 'sending', attempts = 1, locked_at = NOW() - INTERVAL '10 minutes'
++			WHERE delivery_id = (SELECT delivery_id FROM deployment_outbound_webhook_deliveries WHERE deployment_id = $1)`,
++		depl.ID,
++	)
++	s.Require().NoError(err)
++
++	s.Require().NoError(deployhooks.ProcessDueDeliveries(context.Background()))
++
++	a.Equal(1, server.Calls())
++
++	d := s.delivery(depl.ID, whID)
++	a.Equal(app.DeliveryStatusSucceeded, d.Status)
++	a.Equal(2, d.Attempts)
++}
++
++// Test_MaxAttempts_Terminal verifies that retries end in a terminal failed
++// state with a preserved reason once the attempt budget is exhausted.
++func (s *HooksDeliveriesSuite) Test_MaxAttempts_Terminal() {
++	a := assert.New(s.T())
++	server := newFakeWebhookServer(http.StatusBadGateway, http.StatusBadGateway, "")
++	defer server.Close()
++
++	whID := s.insertWebhook(app.TriggerOnDeploySuccess, server.URL(), nil)
++	depl := s.successfulDeployment()
++
++	restore := s.disableTrigger()
++	defer restore()
++
++	s.execCompletion(&deploy.Deployment{
++		ID:       depl.ID,
++		Env:      "production",
++		Branch:   "master",
++		EnvID:    s.GetEnv().ID,
++		AppID:    s.GetApp().ID,
++		ExitCode: null.NewInt(0, true),
++	})
++
++	// One attempt short of the budget: the next claim reaches max attempts.
++	_, err := s.conn.Exec(
++		`UPDATE deployment_outbound_webhook_deliveries
++			SET attempts = $2, next_attempt_at = NOW() - INTERVAL '1 minute'
++			WHERE deployment_id = $1`,
++		depl.ID, app.DeliveryMaxAttempts-1,
++	)
++	s.Require().NoError(err)
++
++	s.Require().NoError(deployhooks.ProcessDueDeliveries(context.Background()))
++
++	a.Equal(1, server.Calls())
++
++	d := s.delivery(depl.ID, whID)
++	a.Equal(app.DeliveryStatusFailed, d.Status)
++	a.Equal(app.DeliveryMaxAttempts, d.Attempts)
++	a.Contains(d.LastError.String, "max delivery attempts")
++	a.Equal(int64(http.StatusBadGateway), d.ResponseStatus.ValueOrZero())
++}
++
++// Test_ConfigChangeAfterEnqueue_KeepsFrozenTarget verifies that editing the
++// webhook after the event was created changes neither the target URL nor the
++// payload used by retries.
++func (s *HooksDeliveriesSuite) Test_ConfigChangeAfterEnqueue_KeepsFrozenTarget() {
++	a := assert.New(s.T())
++	server := newFakeWebhookServer(http.StatusServiceUnavailable, http.StatusOK, "")
++	defer server.Close()
++
++	payload := `{"version":"v1"}`
++	whID := s.insertWebhook(app.TriggerOnDeploySuccess, server.URL(), &payload)
++	depl := s.successfulDeployment()
++
++	restore := s.processSynchronously()
++	defer restore()
++
++	s.execCompletion(&deploy.Deployment{
++		ID:       depl.ID,
++		Env:      "production",
++		Branch:   "master",
++		EnvID:    s.GetEnv().ID,
++		AppID:    s.GetApp().ID,
++		ExitCode: null.NewInt(0, true),
++	})
++
++	a.Equal(1, server.Calls())
++
++	// Edit the trigger configuration after the completion event exists.
++	configured := app.NewStore().OutboundWebhook(context.Background(), s.GetApp().ID, whID)
++	s.Require().NotNil(configured)
++	configured.RequestURL = "http://127.0.0.1:1/unreachable"
++	configured.RequestPayload = null.StringFrom(`{"version":"v2"}`)
++	s.Require().NoError(app.NewStore().UpdateOutboundWebhook(context.Background(), s.GetApp().ID, configured))
++
++	_, err := s.conn.Exec(
++		`UPDATE deployment_outbound_webhook_deliveries SET next_attempt_at = NOW() - INTERVAL '1 minute' WHERE deployment_id = $1`,
++		depl.ID,
++	)
++	s.Require().NoError(err)
++
++	s.Require().NoError(deployhooks.ProcessDueDeliveries(context.Background()))
++
++	// The retry hit the original frozen target again, not the edited URL.
++	a.Equal(2, server.Calls())
++
++	d := s.delivery(depl.ID, whID)
++	a.Equal(app.DeliveryStatusSucceeded, d.Status)
++	a.Equal(server.URL(), d.RequestURL)
++	a.JSONEq(`{"version":"v1"}`, d.RequestBody)
++}
++
++// Test_NetworkError_Retries verifies that a connection error is retryable and
++// never blocks processing.
++func (s *HooksDeliveriesSuite) Test_NetworkError_Retries() {
++	a := assert.New(s.T())
++
++	// Nothing listens on this port.
++	whID := s.insertWebhook(app.TriggerOnDeploySuccess, "http://127.0.0.1:1", nil)
++	depl := s.successfulDeployment()
++
++	restore := s.processSynchronously()
++	defer restore()
++
++	s.execCompletion(&deploy.Deployment{
++		ID:       depl.ID,
++		Env:      "production",
++		Branch:   "master",
++		EnvID:    s.GetEnv().ID,
++		AppID:    s.GetApp().ID,
++		ExitCode: null.NewInt(0, true),
++	})
++
++	d := s.delivery(depl.ID, whID)
++	a.Equal(app.DeliveryStatusPending, d.Status)
++	a.Equal(1, d.Attempts)
++	a.False(d.ResponseStatus.Valid)
++	a.NotEmpty(d.LastError.String)
++	a.True(d.NextAttemptAt.After(time.Now()))
++}
++
++// Test_NoWebhookConfigured_KeepsDefaultBehavior verifies that without any
++// outbound webhook, no delivery records are created and Exec still completes.
++func (s *HooksDeliveriesSuite) Test_NoWebhookConfigured_KeepsDefaultBehavior() {
++	a := assert.New(s.T())
++	depl := s.successfulDeployment()
++
++	s.execCompletion(&deploy.Deployment{
++		ID:       depl.ID,
++		Env:      "production",
++		Branch:   "master",
++		EnvID:    s.GetEnv().ID,
++		AppID:    s.GetApp().ID,
++		ExitCode: null.NewInt(0, true),
++	})
++
++	rows, err := deployhooks.NewStore().OutboundWebhookDeliveries(context.Background(), depl.ID)
++	s.Require().NoError(err)
++	a.Empty(rows)
++}
++
++func TestHooksDeliveries(t *testing.T) {
++	suite.Run(t, &HooksDeliveriesSuite{})
++}
+diff --git a/src/ce/api/app/deploy/deployhooks/hooks_statements.go b/src/ce/api/app/deploy/deployhooks/hooks_statements.go
+index 5ebb12a..8c60a17 100644
+--- a/src/ce/api/app/deploy/deployhooks/hooks_statements.go
++++ b/src/ce/api/app/deploy/deployhooks/hooks_statements.go
+@@ -2,6 +2,14 @@ package deployhooks
+ 
+ type statement struct {
+ 	appDetailsForHooks string
++
++	insertOutboundWebhookDelivery             string
++	claimDueOutboundWebhookDeliveries         string
++	markOutboundWebhookDeliverySucceeded      string
++	markOutboundWebhookDeliveryRetry          string
++	markOutboundWebhookDeliveryFailed         string
++	selectOutboundWebhookDeliveries           string
++	selectOutboundWebhookDeliveryByDeployment string
+ }
+ 
+ var stmt = &statement{
+@@ -15,4 +23,110 @@ var stmt = &statement{
+ 		INNER JOIN apps app ON app.app_id = d.app_id
+ 		WHERE d.deployment_id = $1;
+ 	`,
++
++	insertOutboundWebhookDelivery: `
++		INSERT INTO deployment_outbound_webhook_deliveries (
++			app_id, deployment_id, wh_id, trigger_when,
++			request_url, request_method, request_headers, request_body,
++			status, max_attempts, next_attempt_at
++		) VALUES (
++			$1, $2, $3, $4,
++			$5, $6, $7, $8,
++			'pending', $9, NOW()
++		)
++		ON CONFLICT (deployment_id, wh_id) DO NOTHING;
++	`,
++
++	// Claims rows that are due, as well as sending rows whose lock went stale
++	// after a crash or restart. The attempts value returned with each row is
++	// used as an optimistic concurrency token when the attempt is acknowledged,
++	// so a late response from a reclaimed attempt cannot overwrite a newer one.
++	claimDueOutboundWebhookDeliveries: `
++		WITH due AS (
++			SELECT delivery_id
++			FROM deployment_outbound_webhook_deliveries
++			WHERE
++				(status = 'pending' AND next_attempt_at <= NOW())
++				OR (status = 'sending' AND locked_at < $2)
++			ORDER BY next_attempt_at ASC
++			LIMIT $1
++			FOR UPDATE SKIP LOCKED
++		)
++		UPDATE deployment_outbound_webhook_deliveries d
++		SET
++			status = 'sending',
++			locked_at = NOW(),
++			attempts = d.attempts + 1,
++			last_attempt_at = NOW(),
++			updated_at = NOW()
++		FROM due
++		WHERE d.delivery_id = due.delivery_id
++		RETURNING
++			d.delivery_id, d.app_id, d.deployment_id, d.wh_id, d.trigger_when,
++			d.request_url, d.request_method, d.request_headers, d.request_body,
++			d.status, d.attempts, d.max_attempts,
++			d.last_error, d.response_status, d.response_body,
++			d.next_attempt_at, d.locked_at, d.last_attempt_at, d.succeeded_at,
++			d.created_at, d.updated_at;
++	`,
++
++	markOutboundWebhookDeliverySucceeded: `
++		UPDATE deployment_outbound_webhook_deliveries
++		SET
++			status = 'succeeded',
++			response_status = $3,
++			response_body = $4,
++			last_error = NULL,
++			succeeded_at = NOW(),
++			updated_at = NOW()
++		WHERE delivery_id = $1 AND status = 'sending' AND attempts = $2;
++	`,
++
++	markOutboundWebhookDeliveryRetry: `
++		UPDATE deployment_outbound_webhook_deliveries
++		SET
++			status = 'pending',
++			last_error = $3,
++			response_status = $4,
++			response_body = $5,
++			next_attempt_at = $6,
++			updated_at = NOW()
++		WHERE delivery_id = $1 AND status = 'sending' AND attempts = $2;
++	`,
++
++	markOutboundWebhookDeliveryFailed: `
++		UPDATE deployment_outbound_webhook_deliveries
++		SET
++			status = 'failed',
++			last_error = $3,
++			response_status = $4,
++			response_body = $5,
++			updated_at = NOW()
++		WHERE delivery_id = $1 AND status = 'sending' AND attempts = $2;
++	`,
++
++	selectOutboundWebhookDeliveries: `
++		SELECT
++			delivery_id, app_id, deployment_id, wh_id, trigger_when,
++			request_url, request_method, request_headers, request_body,
++			status, attempts, max_attempts,
++			last_error, response_status, response_body,
++			next_attempt_at, locked_at, last_attempt_at, succeeded_at,
++			created_at, updated_at
++		FROM deployment_outbound_webhook_deliveries
++		WHERE deployment_id = $1
++		ORDER BY delivery_id ASC;
++	`,
++
++	selectOutboundWebhookDeliveryByDeployment: `
++		SELECT
++			delivery_id, app_id, deployment_id, wh_id, trigger_when,
++			request_url, request_method, request_headers, request_body,
++			status, attempts, max_attempts,
++			last_error, response_status, response_body,
++			next_attempt_at, locked_at, last_attempt_at, succeeded_at,
++			created_at, updated_at
++		FROM deployment_outbound_webhook_deliveries
++		WHERE deployment_id = $1 AND wh_id = $2;
++	`,
+ }
+diff --git a/src/ce/api/app/deploy/deployhooks/hooks_test.go b/src/ce/api/app/deploy/deployhooks/hooks_test.go
+index b4142b7..7dd9374 100644
+--- a/src/ce/api/app/deploy/deployhooks/hooks_test.go
++++ b/src/ce/api/app/deploy/deployhooks/hooks_test.go
+@@ -88,6 +88,16 @@ func (s *HooksSuite) TestOutboundWebhooks() {
+ 
+ 	a.NoError(err)
+ 
++	// Deliveries are processed asynchronously in production; process them
++	// synchronously in this assertion.
++	originalTrigger := deployhooks.TriggerDeliveries
++	deployhooks.TriggerDeliveries = func() {
++		s.Require().NoError(deployhooks.ProcessDueDeliveries(context.Background()))
++	}
++	defer func() {
++		deployhooks.TriggerDeliveries = originalTrigger
++	}()
++
+ 	deployhooks.Exec(context.Background(), &deploy.Deployment{
+ 		ID:       depl.ID,
+ 		Env:      "production",
+diff --git a/src/ce/workerserver/job_outbound_webhooks.go b/src/ce/workerserver/job_outbound_webhooks.go
+new file mode 100644
+index 0000000..401d436
+--- /dev/null
++++ b/src/ce/workerserver/job_outbound_webhooks.go
+@@ -0,0 +1,15 @@
++package jobs
++
++import (
++	"context"
++
++	"github.com/stormkit-io/stormkit-io/src/ce/api/app/deploy/deployhooks"
++)
++
++// DeliverOutboundWebhooks processes due deployment completion outbound webhook
++// deliveries: retryable failures (network errors, timeouts, 429 and 5xx) are
++// retried on their exponential backoff schedule, and records stuck in the
++// sending state after a process crash or restart are safely reclaimed.
++func DeliverOutboundWebhooks(ctx context.Context) error {
++	return deployhooks.ProcessDueDeliveries(ctx)
++}
+diff --git a/src/ce/workerserver/worker_scheduler.go b/src/ce/workerserver/worker_scheduler.go
+index 90ade60..6a7d9ac 100644
+--- a/src/ce/workerserver/worker_scheduler.go
++++ b/src/ce/workerserver/worker_scheduler.go
+@@ -93,6 +93,7 @@ func (s *Scheduler) RegisterMasterTasks(ctx context.Context) {
+ 		{Handler: CleanupDeletedTeams, Def: dj(EVERY_HOUR), Opt: immediate},
+ 		{Handler: PingDomains, Def: dj(EVERY_MINUTE), Opt: immediate},
+ 		{Handler: TimedOutDeployments, Def: dj(EVERY_MINUTE), Opt: immediate},
++		{Handler: DeliverOutboundWebhooks, Def: dj(EVERY_MINUTE), Opt: immediate},
+ 	}
+ 
+ 	s.masterTasks = s.registerTasks(ctx, tasks)
+diff --git a/src/migrations/0029_2026-10-08.up.sql b/src/migrations/0029_2026-10-08.up.sql
+new file mode 100644
+index 0000000..0f0046b
+--- /dev/null
++++ b/src/migrations/0029_2026-10-08.up.sql
+@@ -0,0 +1,48 @@
++-- Frozen, per-deployment/per-trigger delivery records for the deployment
++-- completion outbound webhooks (on_deploy_success / on_deploy_failed).
++--
++-- Before this table existed the completion event was dispatched synchronously
++-- once and forgotten: a network timeout or a process restart meant the external
++-- system never learned the outcome, and a failed "save result" step could send
++-- the same event twice on retry. Each row freezes the request URL, method,
++-- headers and the already-rendered body at event creation time, so later edits
++-- to the webhook configuration never change what a retry sends, and tracks the
++-- delivery state machine (pending -> sending -> succeeded | failed) with
++-- attempt counts and backoff scheduling.
++CREATE TABLE IF NOT EXISTS deployment_outbound_webhook_deliveries (
++    delivery_id     bigserial PRIMARY KEY,
++    app_id          bigint NOT NULL,
++    deployment_id   bigint NOT NULL,
++    wh_id           integer NOT NULL,
++    trigger_when    text NOT NULL,
++    request_url     text NOT NULL,
++    request_method  text NOT NULL,
++    request_headers jsonb NOT NULL DEFAULT '{}'::jsonb,
++    request_body    text NOT NULL DEFAULT '',
++    -- pending: waiting for (the next) attempt
++    -- sending: claimed by a worker; reclaimed when locked_at goes stale
++    -- succeeded: terminal, 2xx acknowledged
++    -- failed: terminal, permanent non-retryable rejection (e.g. 4xx) or exhausted
++    status          text NOT NULL DEFAULT 'pending',
++    attempts        integer NOT NULL DEFAULT 0,
++    max_attempts    integer NOT NULL DEFAULT 12,
++    last_error      text,
++    response_status integer,
++    response_body   text,
++    next_attempt_at timestamptz NOT NULL DEFAULT NOW(),
++    locked_at       timestamptz,
++    last_attempt_at timestamptz,
++    succeeded_at    timestamptz,
++    created_at      timestamptz NOT NULL DEFAULT NOW(),
++    updated_at      timestamptz NOT NULL DEFAULT NOW()
++);
++
++-- Idempotency boundary: a single frozen event per deployment and trigger, no
++-- matter how often the completion path runs.
++CREATE UNIQUE INDEX IF NOT EXISTS idx_dowd_deployment_wh_unique
++    ON deployment_outbound_webhook_deliveries (deployment_id, wh_id);
++
++-- Worker's due-queue lookup: due pending rows plus stale sending rows left
++-- behind by a crashed or restarted process.
++CREATE INDEX IF NOT EXISTS idx_dowd_status_next_attempt
++    ON deployment_outbound_webhook_deliveries (status, next_attempt_at);

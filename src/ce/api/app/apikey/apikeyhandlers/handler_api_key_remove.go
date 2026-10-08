@@ -1,0 +1,78 @@
+package apikeyhandlers
+
+import (
+	"net/http"
+
+	"github.com/stormkit-io/stormkit-io/src/ce/api/app"
+	"github.com/stormkit-io/stormkit-io/src/ce/api/app/apikey"
+	"github.com/stormkit-io/stormkit-io/src/ce/api/app/buildconf"
+	"github.com/stormkit-io/stormkit-io/src/ce/api/user"
+	"github.com/stormkit-io/stormkit-io/src/ee/api/team"
+	"github.com/stormkit-io/stormkit-io/src/lib/shttp"
+	"github.com/stormkit-io/stormkit-io/src/lib/utils"
+)
+
+func handlerAPIKeyRemove(req *user.RequestContext) *shttp.Response {
+	keyID := utils.StringToID(req.Query().Get("keyId"))
+
+	if keyID == 0 {
+		return &shttp.Response{
+			Status: http.StatusBadRequest,
+			Data: map[string]string{
+				"error": "Invalid keyId query parameter.",
+			},
+		}
+	}
+
+	store := apikey.NewStore()
+	key, err := store.APIKeyByID(req.Context(), keyID)
+
+	if err != nil {
+		return shttp.Error(err)
+	}
+
+	if key == nil {
+		return shttp.NotFound()
+	}
+
+	if key.EnvID != 0 {
+		if !buildconf.NewStore().IsMember(req.Context(), key.EnvID, req.User.ID) {
+			return shttp.Forbidden()
+		}
+	} else if key.TeamID != 0 {
+		// Team keys act on the whole team, so managing them needs the same
+		// write access as creating them.
+		myTeam, err := team.NewStore().Team(req.Context(), key.TeamID, req.User.ID)
+
+		if err != nil {
+			return shttp.Error(err)
+		}
+
+		if myTeam == nil || !team.HasWriteAccess(myTeam.CurrentUserRole) {
+			return shttp.Forbidden()
+		}
+	} else if key.UserID != 0 {
+		// Personal keys, even those that also name an app, belong to their owner.
+		if key.UserID != req.User.ID {
+			return shttp.Forbidden()
+		}
+	} else if key.AppID != 0 {
+		myApp, err := app.NewStore().AppByID(req.Context(), key.AppID)
+
+		if err != nil {
+			return shttp.Error(err)
+		}
+
+		if myApp == nil || !team.NewStore().IsMember(req.Context(), req.User.ID, myApp.TeamID) {
+			return shttp.Forbidden()
+		}
+	} else {
+		return shttp.Forbidden()
+	}
+
+	if err := apikey.NewStore().RemoveAPIKey(req.Context(), keyID); err != nil {
+		return shttp.Error(err)
+	}
+
+	return shttp.OK()
+}
