@@ -1,0 +1,2752 @@
+diff --git a/src/ce/api/app/volumes/volume_aws.go b/src/ce/api/app/volumes/volume_aws.go
+index 9d5739c..9e77293 100644
+--- a/src/ce/api/app/volumes/volume_aws.go
++++ b/src/ce/api/app/volumes/volume_aws.go
+@@ -3,6 +3,7 @@ package volumes
+ import (
+ 	"bytes"
+ 	"context"
++	"errors"
+ 	"io"
+ 	"path"
+ 	"strings"
+@@ -59,6 +60,12 @@ func (c *vmAWS) download(file *File) (io.ReadSeeker, error) {
+ 	})
+ 
+ 	if err != nil {
++		var noSuchKey *types.NoSuchKey
++
++		if errors.As(err, &noSuchKey) {
++			return nil, nil
++		}
++
+ 		return nil, err
+ 	}
+ 
+@@ -79,37 +86,63 @@ func (c *vmAWS) download(file *File) (io.ReadSeeker, error) {
+ 	return bytes.NewReader(data), nil
+ }
+ 
+-func (c *vmAWS) upload(args uploadArgs) (*File, error) {
++// stage writes a file to its unique staging key in the bucket. S3 PutObject
++// is atomic, so concurrent readers either see the previous object or the new
++// one, never partial bytes.
++func (c *vmAWS) stage(args uploadArgs) (*File, error) {
++	bucket, keyDir := c.splitPath(args.ref.Path)
++
+ 	file := integrations.File{
+ 		Pointer:      args.file,
+ 		Size:         args.size,
+-		RelativePath: args.dstFileName,
+-		ContentType:  integrations.DetectContentType(args.dstFileName, args.file),
++		RelativePath: args.ref.Name,
++		ContentType:  integrations.DetectContentType(args.logicalName, args.file),
+ 	}
+ 
+ 	opts := integrations.S3Args{
+-		BucketName: c.BucketName,
+-		KeyPrefix:  args.dstFilePath,
++		BucketName: bucket,
++		KeyPrefix:  keyDir,
+ 	}
+ 
+-	err := c.cli.UploadFile(file, opts)
+-
+-	if err != nil {
++	if err := c.cli.UploadFile(file, opts); err != nil {
+ 		return nil, err
+ 	}
+ 
+ 	return &File{
+ 		Size:      args.size,
+-		Path:      path.Join(c.BucketName, args.dstFilePath, path.Dir(args.dstFileName)),
+-		Name:      args.dstFileName,
++		Path:      args.ref.Path,
++		Name:      args.logicalName,
+ 		EnvID:     args.envID,
+ 		CreatedAt: utils.NewUnix(),
+ 		Metadata: utils.Map{
+-			"mountType": AWSS3,
++			"mountType":  AWSS3,
++			"objectName": args.ref.Name,
+ 		},
+ 	}, nil
+ }
+ 
++// removeOne removes a single object. A missing object is not an error.
++func (c *vmAWS) removeOne(file *File) error {
++	bucket, key := c.parseBucketInfo(file)
++
++	_, err := c.cli.S3Client.DeleteObject(context.Background(), &s3.DeleteObjectInput{
++		Bucket: &bucket,
++		Key:    &key,
++	})
++
++	if err != nil {
++		var noSuchKey *types.NoSuchKey
++
++		if errors.As(err, &noSuchKey) {
++			return nil
++		}
++
++		return err
++	}
++
++	return nil
++}
++
+ // removeFiles deletes files from the S3 destination. This function
+ // supports deleting from different buckets.
+ func (c *vmAWS) removeFiles(files []*File) ([]*File, error) {
+@@ -144,12 +177,31 @@ func (c *vmAWS) removeFiles(files []*File) ([]*File, error) {
+ 	return files, nil
+ }
+ 
+-func (c *vmAWS) parseBucketInfo(file *File) (string, string) {
+-	pieces := strings.SplitN(file.Path, "/", 2)
++// splitPath splits a stored file path into its bucket and its bucket-relative
++// key directory.
++func (c *vmAWS) splitPath(storedPath string) (string, string) {
++	pieces := strings.SplitN(storedPath, "/", 2)
+ 
+ 	if len(pieces) != 2 {
+ 		return "", ""
+ 	}
+ 
+-	return pieces[0], path.Join(pieces[1], file.Name)
++	return pieces[0], pieces[1]
++}
++
++// parseBucketInfo returns the bucket and the full object key of a file. Rows
++// created through the staging lifecycle record the flattened object name in
++// metadata; legacy rows encoded the whole (possibly nested) name directly.
++func (c *vmAWS) parseBucketInfo(file *File) (string, string) {
++	bucket, keyDir := c.splitPath(file.Path)
++
++	objectName := file.Name
++
++	if file.Metadata != nil {
++		if storedName, ok := file.Metadata["objectName"].(string); ok && storedName != "" {
++			objectName = storedName
++		}
++	}
++
++	return bucket, path.Join(keyDir, objectName)
+ }
+diff --git a/src/ce/api/app/volumes/volume_aws_test.go b/src/ce/api/app/volumes/volume_aws_test.go
+index c37b4b4..0c03ec1 100644
+--- a/src/ce/api/app/volumes/volume_aws_test.go
++++ b/src/ce/api/app/volumes/volume_aws_test.go
+@@ -60,6 +60,7 @@ func (s *VolumesAWSSuite) Test_Upload() {
+ 						case *s3.PutObjectInput:
+ 							s.Equal("my-bucket", *v.Bucket)
+ 							s.Equal(int64(691), *v.ContentLength)
++							s.Equal("a5818e29151/objects/staged-token/my-file.txt", *v.Key)
+ 						default:
+ 							s.NoError(errors.New("unknown call"))
+ 						}
+@@ -99,16 +100,24 @@ func (s *VolumesAWSSuite) Test_Upload() {
+ 		},
+ 	}
+ 
+-	file, err := volumes.Upload(cfg, args)
++	reader, fileName, err := volumes.OpenUpload(args)
++	s.Require().NoError(err)
++
++	defer reader.Close()
++
++	file, err := volumes.StageUpload(cfg, args, "staged-token", fileName, reader)
+ 	s.NoError(err)
+ 	s.NotEmpty(file)
+ 	s.Equal(&volumes.File{
+-		ID:        0,
+-		EnvID:     args.EnvID,
+-		Size:      int64(691),
+-		Name:      "my-file.txt",
+-		Path:      "my-bucket/a5818e29151",
+-		Metadata:  utils.Map{"mountType": volumes.AWSS3},
++		ID:    0,
++		EnvID: args.EnvID,
++		Size:  int64(691),
++		Name:  "my-file.txt",
++		Path:  "my-bucket/a5818e29151/objects/staged-token",
++		Metadata: utils.Map{
++			"mountType":  volumes.AWSS3,
++			"objectName": "my-file.txt",
++		},
+ 		CreatedAt: utils.NewUnix(),
+ 	}, file)
+ }
+diff --git a/src/ce/api/app/volumes/volume_filesys.go b/src/ce/api/app/volumes/volume_filesys.go
+index 6e74e7a..9c4b092 100644
+--- a/src/ce/api/app/volumes/volume_filesys.go
++++ b/src/ce/api/app/volumes/volume_filesys.go
+@@ -15,9 +15,10 @@ import (
+ type uploadArgs struct {
+ 	file        multipart.File
+ 	size        int64
+-	dstFileName string
+-	dstFilePath string
+ 	envID       types.ID
++	token       string
++	logicalName string
++	ref         ObjectRef
+ }
+ 
+ type vmFileSys struct {
+@@ -43,7 +44,7 @@ func clientFilesys(c *admin.VolumesConfig) *vmFileSys {
+ }
+ 
+ func (fs *vmFileSys) download(file *File) (io.ReadSeeker, error) {
+-	f, err := os.Open(file.FullPath())
++	f, err := os.Open(fs.location(file))
+ 
+ 	if os.IsNotExist(err) {
+ 		return nil, nil
+@@ -52,12 +53,25 @@ func (fs *vmFileSys) download(file *File) (io.ReadSeeker, error) {
+ 	return f, nil
+ }
+ 
+-// upload a file to the destination specified by args.MountType.
++// location returns the on-disk path of a file. Rows created through the
++// staging lifecycle store their flattened object name in metadata; legacy
++// rows fall back to the file name encoded in the row.
++func (fs *vmFileSys) location(file *File) string {
++	if file.Metadata != nil {
++		if objectName, ok := file.Metadata["objectName"].(string); ok && objectName != "" {
++			return filepath.Join(file.Path, filepath.Base(objectName))
++		}
++	}
++
++	return file.FullPath()
++}
++
++// stage writes a file into its unique staging directory. Bytes go to a
++// temporary file first and are renamed into place, so a crashed or
++// interrupted write never leaves a half-written object behind.
+ // This function assumes that the file has already been sanitized and validated by the caller.
+-func (fs *vmFileSys) upload(args uploadArgs) (*File, error) {
+-	destination, err := filepath.Abs(
+-		filepath.Join(fs.RootPath, args.dstFilePath, filepath.Dir(args.dstFileName)),
+-	)
++func (fs *vmFileSys) stage(args uploadArgs) (*File, error) {
++	destination, err := filepath.Abs(args.ref.Path)
+ 
+ 	if err != nil {
+ 		return nil, err
+@@ -68,40 +82,65 @@ func (fs *vmFileSys) upload(args uploadArgs) (*File, error) {
+ 		return nil, err
+ 	}
+ 
+-	dst, err := os.Create(filepath.Join(destination, filepath.Base(args.dstFileName)))
++	objectName := filepath.Base(args.ref.Name)
++	finalPath := filepath.Join(destination, objectName)
++	tmpPath := filepath.Join(destination, "."+objectName+".tmp-"+args.token)
++
++	dst, err := os.Create(tmpPath)
+ 
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 
+-	size, err := io.Copy(dst, args.file)
++	size, copyErr := io.Copy(dst, args.file)
++	closeErr := dst.Close()
+ 
+-	if err != nil {
++	if copyErr != nil {
++		os.Remove(tmpPath)
++		return nil, copyErr
++	}
++
++	if closeErr != nil {
++		os.Remove(tmpPath)
++		return nil, closeErr
++	}
++
++	if err := os.Rename(tmpPath, finalPath); err != nil {
++		os.Remove(tmpPath)
+ 		return nil, err
+ 	}
+ 
+ 	return &File{
+ 		Size:      size,
+ 		Path:      destination,
+-		Name:      args.dstFileName,
++		Name:      args.logicalName,
+ 		EnvID:     args.envID,
+ 		CreatedAt: utils.NewUnix(),
+ 		Metadata: utils.Map{
+-			"mountType": FileSys,
++			"mountType":  FileSys,
++			"objectName": objectName,
+ 		},
+ 	}, nil
+ }
+ 
++// removeOne removes a single object. A missing object is not an error.
++func (fs *vmFileSys) removeOne(file *File) error {
++	if err := os.Remove(fs.location(file)); err != nil {
++		if os.IsNotExist(err) {
++			return nil
++		}
++
++		return err
++	}
++
++	return nil
++}
++
+ func (fs *vmFileSys) removeFiles(files []*File) ([]*File, error) {
+ 	success := []*File{}
+ 
+ 	for _, file := range files {
+-		if err := os.Remove(file.FullPath()); err != nil {
+-			if os.IsNotExist(err) {
+-				success = append(success, file)
+-				continue
+-			}
+-
++		if err := fs.removeOne(file); err != nil {
+ 			return success, err
+ 		}
+ 
+diff --git a/src/ce/api/app/volumes/volume_lifecycle.go b/src/ce/api/app/volumes/volume_lifecycle.go
+new file mode 100644
+index 0000000..112119d
+--- /dev/null
++++ b/src/ce/api/app/volumes/volume_lifecycle.go
+@@ -0,0 +1,219 @@
++package volumes
++
++import (
++	"context"
++
++	"github.com/stormkit-io/stormkit-io/src/ce/api/admin"
++	"github.com/stormkit-io/stormkit-io/src/lib/slog"
++	"github.com/stormkit-io/stormkit-io/src/lib/types"
++	"github.com/stormkit-io/stormkit-io/src/lib/utils"
++)
++
++// UploadItem is one file of a multipart batch upload.
++type UploadItem struct {
++	AppID              types.ID
++	EnvID              types.ID
++	FileHeader         FileHeader
++	ContentDisposition map[string]string
++}
++
++// UploadBatch stages and publishes uploads one file at a time. Each file is
++// an independent operation: an invalid name, a failed object write or a
++// failed metadata commit is recorded under failed, while every other file
++// still publishes (partial-success semantics). Same-name uploads inside one
++// batch resolve to the last version, exactly like the old API contract.
++//
++// The physical object is registered before it is written and the volumes row
++// only starts referencing it inside a transaction, so at any observable
++// point list, download, public-file and size describe the same version.
++func UploadBatch(ctx context.Context, vc *admin.VolumesConfig, items []UploadItem) ([]*File, map[string]string) {
++	store := Ops()
++	files := []*File{}
++	failed := map[string]string{}
++	indexByName := map[string]int{}
++
++	for _, item := range items {
++		displayName := utils.GetString(item.ContentDisposition["filename"], item.FileHeader.Name())
++
++		reader, fileName, err := OpenUpload(UploadArgs{
++			AppID:              item.AppID,
++			EnvID:              item.EnvID,
++			FileHeader:         item.FileHeader,
++			ContentDisposition: item.ContentDisposition,
++		})
++
++		if err != nil {
++			failed[displayName] = err.Error()
++			continue
++		}
++
++		token := utils.RandomToken(stagingTokenLength)
++		ref := StagingRef(vc, item.AppID, item.EnvID, token, fileName)
++
++		op := &Op{
++			EnvID:     item.EnvID,
++			Type:      OpUpload,
++			Status:    OpPending,
++			FileName:  fileName,
++			FileSize:  item.FileHeader.Size(),
++			MountType: vc.MountType,
++			Object:    ref,
++		}
++
++		if err := store.CreateOp(ctx, op); err != nil {
++			reader.Close()
++			failed[displayName] = err.Error()
++			continue
++		}
++
++		staged, err := StageUpload(vc, UploadArgs{
++			AppID:              item.AppID,
++			EnvID:              item.EnvID,
++			FileHeader:         item.FileHeader,
++			ContentDisposition: item.ContentDisposition,
++		}, token, fileName, reader)
++
++		reader.Close()
++
++		if err != nil {
++			abortUpload(ctx, store, vc, op, err.Error())
++			failed[displayName] = err.Error()
++			continue
++		}
++
++		if staged == nil {
++			reason := "file storage mount type is not supported"
++			abortUpload(ctx, store, vc, op, reason)
++			failed[displayName] = reason
++			continue
++		}
++
++		if _, replaced, err := store.PublishUpload(ctx, op, staged); err != nil {
++			abortUpload(ctx, store, vc, op, err.Error())
++			failed[displayName] = err.Error()
++			continue
++		} else {
++			finishUpload(ctx, store, vc, op, replaced)
++		}
++
++		// Last upload of a logical name wins; keep its position in the
++		// response stable.
++		if idx, ok := indexByName[fileName]; ok {
++			files[idx] = staged
++		} else {
++			indexByName[fileName] = len(files)
++			files = append(files, staged)
++		}
++	}
++
++	return files, failed
++}
++
++// DeleteBatch removes objects first and consumes their metadata rows only
++// after the physical removal succeeded. A failed object removal leaves the
++// row (and its object) untouched and retryable instead of producing a row
++// whose download 404s. Missing objects are consumed normally.
++func DeleteBatch(ctx context.Context, vc *admin.VolumesConfig, files []*File) ([]*File, map[string]string) {
++	store := Ops()
++	removed := []*File{}
++	failed := map[string]string{}
++
++	for _, file := range files {
++		op := &Op{
++			EnvID:     file.EnvID,
++			Type:      OpDelete,
++			Status:    OpPending,
++			FileID:    file.ID,
++			FileName:  file.Name,
++			FileSize:  file.Size,
++			MountType: MountTypeOf(file),
++			Object:    RefOf(file),
++		}
++
++		if err := store.CreateOp(ctx, op); err != nil {
++			failed[file.ID.String()] = err.Error()
++			continue
++		}
++
++		if err := RemoveObject(vc, op.Object); err != nil {
++			if failErr := store.FailOp(ctx, op.ID, err.Error()); failErr != nil {
++				slog.Errorf("cannot mark volume delete op %d failed: %s", op.ID, failErr.Error())
++			}
++
++			failed[file.ID.String()] = err.Error()
++			continue
++		}
++
++		if err := store.CommitDelete(ctx, op); err != nil {
++			failed[file.ID.String()] = err.Error()
++			continue
++		}
++
++		removed = append(removed, file)
++	}
++
++	return removed, failed
++}
++
++// abortUpload drives an upload to a definite failed state: its staged object
++// is removed and the op consumed. If either step cannot finish now, the op
++// row stays behind and ReconcileOps reaches the same state after restart.
++func abortUpload(ctx context.Context, store *opsStore, vc *admin.VolumesConfig, op *Op, reason string) {
++	if err := store.FailOp(ctx, op.ID, reason); err != nil {
++		slog.Errorf("cannot mark volume upload op %d failed: %s", op.ID, err.Error())
++		return
++	}
++
++	if err := RemoveObject(vc, op.Object); err != nil {
++		slog.Errorf("cannot remove staged object of failed volume upload op %d: %s", op.ID, err.Error())
++		return
++	}
++
++	if err := store.DeleteOp(ctx, op.ID); err != nil {
++		slog.Errorf("cannot delete failed volume upload op %d: %s", op.ID, err.Error())
++	}
++}
++
++// finishUpload removes the object displaced by a committed replacement and
++// consumes the op. When the old object cannot be removed yet, the committed
++// op row is retained so ReconcileOps retries without touching the live
++// object.
++func finishUpload(ctx context.Context, store *opsStore, vc *admin.VolumesConfig, op *Op, replaced *ObjectRef) {
++	if replaced != nil {
++		gone, err := removeIfUnreferenced(ctx, store, vc, *replaced)
++
++		if err != nil {
++			slog.Errorf("cannot verify displaced object of volume upload op %d: %s", op.ID, err.Error())
++			return
++		}
++
++		if !gone {
++			return
++		}
++	}
++
++	if err := store.DeleteOp(ctx, op.ID); err != nil {
++		slog.Errorf("cannot delete finished volume upload op %d: %s", op.ID, err.Error())
++	}
++}
++
++// removeIfUnreferenced removes the object unless a published volumes row or a
++// pending upload still references it. gone is true when the object is absent
++// afterwards (already missing objects count as gone).
++func removeIfUnreferenced(ctx context.Context, store *opsStore, vc *admin.VolumesConfig, ref ObjectRef) (gone bool, err error) {
++	protected, err := store.IsObjectProtected(ctx, vc.MountType, ref)
++
++	if err != nil {
++		return false, err
++	}
++
++	if protected {
++		return false, nil
++	}
++
++	if err := RemoveObject(vc, ref); err != nil {
++		return false, err
++	}
++
++	return true, nil
++}
+diff --git a/src/ce/api/app/volumes/volume_lifecycle_test.go b/src/ce/api/app/volumes/volume_lifecycle_test.go
+new file mode 100644
+index 0000000..48d381e
+--- /dev/null
++++ b/src/ce/api/app/volumes/volume_lifecycle_test.go
+@@ -0,0 +1,477 @@
++package volumes_test
++
++import (
++	"bytes"
++	"context"
++	"errors"
++	"io"
++	"mime/multipart"
++	"os"
++	"path/filepath"
++	"testing"
++	"time"
++
++	"github.com/stormkit-io/stormkit-io/src/ce/api/admin"
++	"github.com/stormkit-io/stormkit-io/src/ce/api/app/volumes"
++	"github.com/stormkit-io/stormkit-io/src/lib/database/databasetest"
++	"github.com/stormkit-io/stormkit-io/src/lib/factory"
++	"github.com/stormkit-io/stormkit-io/src/lib/types"
++	"github.com/stretchr/testify/suite"
++)
++
++var (
++	_ multipart.File     = failingReader{}
++	_ volumes.FileHeader = (*stubFileHeader)(nil)
++)
++
++// stubFileHeader is an in-memory FileHeader for lifecycle tests.
++type stubFileHeader struct {
++	name    string
++	data    []byte
++	readErr error
++}
++
++type stubMultipartFile struct {
++	*bytes.Reader
++	io.Closer
++}
++
++type failingReader struct{}
++
++func (failingReader) Read([]byte) (int, error)          { return 0, errors.New("broken pipe") }
++func (failingReader) ReadAt([]byte, int64) (int, error) { return 0, errors.New("broken pipe") }
++func (failingReader) Seek(int64, int) (int64, error)    { return 0, errors.New("broken pipe") }
++func (failingReader) Close() error                      { return nil }
++
++func (h *stubFileHeader) Open() (multipart.File, error) {
++	if h.readErr != nil {
++		return failingReader{}, nil
++	}
++
++	return &stubMultipartFile{
++		Reader: bytes.NewReader(h.data),
++		Closer: io.NopCloser(nil),
++	}, nil
++}
++
++func (h *stubFileHeader) Name() string { return h.name }
++func (h *stubFileHeader) Size() int64  { return int64(len(h.data)) }
++
++type VolumeLifecycleSuite struct {
++	suite.Suite
++	*factory.Factory
++	conn   databasetest.TestDB
++	tmpdir string
++	envID  types.ID
++	cfg    *admin.VolumesConfig
++}
++
++func (s *VolumeLifecycleSuite) BeforeTest(suiteName, _ string) {
++	s.conn = databasetest.InitTx(suiteName)
++	s.Factory = factory.New(s.conn)
++
++	volumes.CachedFileSys = nil
++
++	tmpdir, err := os.MkdirTemp("", "tmp-volume-lifecycle-")
++	s.Require().NoError(err)
++	s.tmpdir = tmpdir
++
++	app := s.MockApp(nil)
++	env := s.MockEnv(app)
++	s.envID = env.ID
++
++	s.cfg = &admin.VolumesConfig{
++		MountType: volumes.FileSys,
++		RootPath:  s.tmpdir,
++	}
++}
++
++func (s *VolumeLifecycleSuite) AfterTest(_, _ string) {
++	s.conn.CloseTx()
++	volumes.CachedFileSys = nil
++	os.RemoveAll(s.tmpdir)
++}
++
++func (s *VolumeLifecycleSuite) item(name, content string) volumes.UploadItem {
++	return volumes.UploadItem{
++		EnvID: s.envID,
++		FileHeader: &stubFileHeader{
++			name: name,
++			data: []byte(content),
++		},
++		ContentDisposition: map[string]string{"filename": name},
++	}
++}
++
++func (s *VolumeLifecycleSuite) countOps() int {
++	var count int
++
++	s.NoError(s.conn.QueryRow(`SELECT COUNT(*) FROM volumes_ops`).Scan(&count))
++
++	return count
++}
++
++func (s *VolumeLifecycleSuite) countFiles() int {
++	var count int
++
++	s.NoError(s.conn.QueryRow(`SELECT COUNT(*) FROM volumes WHERE env_id = $1`, s.envID).Scan(&count))
++
++	return count
++}
++
++// physicalFiles returns every regular object left under the volume root.
++func (s *VolumeLifecycleSuite) physicalFiles() []string {
++	found := []string{}
++
++	s.NoError(filepath.WalkDir(s.tmpdir, func(p string, d os.DirEntry, err error) error {
++		if err != nil {
++			return err
++		}
++
++		if !d.IsDir() {
++			found = append(found, p)
++		}
++
++		return nil
++	}))
++
++	return found
++}
++
++func (s *VolumeLifecycleSuite) download(file *volumes.File) string {
++	reader, err := volumes.Download(s.cfg, file)
++	s.Require().NoError(err)
++	s.Require().NotNil(reader)
++
++	data, err := io.ReadAll(reader)
++	s.Require().NoError(err)
++
++	return string(data)
++}
++
++// Test_UploadBatch_PublishesOneVersion verifies the complete upload and
++// replacement lifecycle: every reader resolves to the committed version and
++// the displaced object is removed once nothing references it.
++func (s *VolumeLifecycleSuite) Test_UploadBatch_PublishesOneVersion() {
++	ctx := context.Background()
++
++	files, failed := volumes.UploadBatch(ctx, s.cfg, []volumes.UploadItem{
++		s.item("docs/readme.txt", "v1"),
++	})
++
++	s.Empty(failed)
++	s.Len(files, 1)
++
++	first := files[0]
++	s.Equal("docs/readme.txt", first.Name)
++	s.Equal(int64(2), first.Size)
++	s.FileExists(volumes.PhysicalKey(volumes.FileSys, volumes.RefOf(first)))
++	s.Equal("v1", s.download(first))
++
++	size, err := volumes.Store().VolumeSize(ctx, s.envID)
++	s.NoError(err)
++	s.Equal(int64(2), size)
++	s.Equal(0, s.countOps(), "finished upload must not leave ops behind")
++
++	// Replace with a different size. Until commit old version is served;
++	// after commit list/download/size must all describe the new bytes.
++	files, failed = volumes.UploadBatch(ctx, s.cfg, []volumes.UploadItem{
++		s.item("docs/readme.txt", "version-two"),
++	})
++
++	s.Empty(failed)
++	s.Len(files, 1)
++
++	replaced := files[0]
++	s.Equal(first.ID, replaced.ID, "file id stays stable across replacements")
++	s.Equal(int64(11), replaced.Size)
++
++	rows, err := volumes.Store().SelectFiles(ctx, volumes.SelectFilesArgs{EnvID: s.envID})
++	s.NoError(err)
++	s.Len(rows, 1)
++
++	current := rows[0]
++	s.Equal(int64(11), current.Size)
++	s.True(current.UpdatedAt.Valid, "row records the replacement time")
++	s.Equal("version-two", s.download(current))
++	s.Equal(first.ID.String(), current.ID.String())
++
++	size, err = volumes.Store().VolumeSize(ctx, s.envID)
++	s.NoError(err)
++	s.Equal(int64(11), size, "capacity stat follows the committed version")
++
++	s.Len(s.physicalFiles(), 1, "displaced object must be removed")
++	s.FileExists(volumes.PhysicalKey(volumes.FileSys, volumes.RefOf(current)))
++	s.Equal(0, s.countOps())
++}
++
++// Test_UploadBatch_NestedName verifies nested logical names flatten into
++// unique object directories while preserving the logical name in metadata.
++func (s *VolumeLifecycleSuite) Test_UploadBatch_NestedName() {
++	ctx := context.Background()
++
++	files, failed := volumes.UploadBatch(ctx, s.cfg, []volumes.UploadItem{
++		s.item("a/b/c.txt", "deep"),
++	})
++
++	s.Empty(failed)
++	s.Len(files, 1)
++	s.Equal("a/b/c.txt", files[0].Name)
++	s.Equal("deep", s.download(files[0]))
++}
++
++// Test_UploadBatch_PartialSuccess keeps the existing semantics: an invalid
++// file is reported under failed while the rest of the batch publishes.
++func (s *VolumeLifecycleSuite) Test_UploadBatch_PartialSuccess() {
++	ctx := context.Background()
++
++	files, failed := volumes.UploadBatch(ctx, s.cfg, []volumes.UploadItem{
++		s.item("../escape.txt", "nope"),
++		s.item("good.txt", "yes"),
++	})
++
++	s.Len(files, 1)
++	s.Equal("good.txt", files[0].Name)
++	s.Contains(failed, "../escape.txt")
++	s.Equal(1, s.countFiles())
++	s.Equal(0, s.countOps())
++}
++
++// Test_UploadBatch_ObjectWriteFailure leaves a definite failure: no metadata,
++// no op row and no staged bytes, so the request can simply be retried.
++func (s *VolumeLifecycleSuite) Test_UploadBatch_ObjectWriteFailure() {
++	ctx := context.Background()
++
++	files, failed := volumes.UploadBatch(ctx, s.cfg, []volumes.UploadItem{
++		{
++			EnvID: s.envID,
++			FileHeader: &stubFileHeader{
++				name:    "broken.txt",
++				data:    []byte("x"),
++				readErr: errors.New("broken pipe"),
++			},
++			ContentDisposition: map[string]string{"filename": "broken.txt"},
++		},
++		s.item("good.txt", "yes"),
++	})
++
++	s.Len(files, 1)
++	s.Equal("good.txt", files[0].Name)
++	s.Contains(failed, "broken.txt")
++	s.Equal(1, s.countFiles())
++	s.Equal(0, s.countOps(), "failed upload must be fully aborted")
++
++	for _, p := range s.physicalFiles() {
++		s.NotContains(p, "broken.txt")
++	}
++}
++
++// Test_DeleteBatch_PhysicalFailureKeepsRow verifies that a failing object
++// removal keeps a downloadable, retryable row instead of an empty one, and
++// that reconciliation completes the delete once the backend recovers.
++func (s *VolumeLifecycleSuite) Test_DeleteBatch_PhysicalFailureKeepsRow() {
++	ctx := context.Background()
++
++	files, failed := volumes.UploadBatch(ctx, s.cfg, []volumes.UploadItem{
++		s.item("doc.txt", "data"),
++	})
++
++	s.Empty(failed)
++	file := files[0]
++	originalPath := file.Path
++
++	// Repoint the row at a location where object removal deterministically
++	// fails (ENOTDIR on /dev/null), independently of process privileges.
++	_, err := s.conn.Exec(`UPDATE volumes SET file_path = $2 WHERE file_id = $1`, file.ID, "/dev/null")
++	s.NoError(err)
++
++	file.Path = "/dev/null"
++
++	removed, delFailed := volumes.DeleteBatch(ctx, s.cfg, []*volumes.File{file})
++	s.Empty(removed)
++	s.Contains(delFailed, file.ID.String())
++	s.Equal(1, s.countFiles(), "row must stay while the object cannot be removed")
++	s.Equal(1, s.countOps(), "retryable delete op must stay")
++
++	s.Require().NoError(volumes.ReconcileOps(ctx, s.cfg))
++	s.Equal(1, s.countFiles(), "still broken: row and op persist")
++	s.Equal(1, s.countOps())
++
++	// Backend recovers: metadata and the pending op point back at the real
++	// object, so the retried remove succeeds and both rows are consumed.
++	_, err = s.conn.Exec(`UPDATE volumes SET file_path = $2 WHERE file_id = $1`, file.ID, originalPath)
++	s.NoError(err)
++	_, err = s.conn.Exec(`
++		UPDATE volumes_ops
++		SET object = jsonb_set(object, '{path}', to_jsonb($2::text))
++		WHERE file_id = $1 AND op_type = 'delete'
++	`, file.ID, originalPath)
++	s.NoError(err)
++	s.Require().NoError(volumes.ReconcileOps(ctx, s.cfg))
++	s.Equal(0, s.countFiles(), "row consumed after the object is gone")
++	s.Equal(0, s.countOps())
++}
++
++// Test_DeleteBatch_MissingObjectConsumesRow treats an already-missing object
++// as success, matching the legacy contract.
++func (s *VolumeLifecycleSuite) Test_DeleteBatch_MissingObjectConsumesRow() {
++	ctx := context.Background()
++
++	files, failed := volumes.UploadBatch(ctx, s.cfg, []volumes.UploadItem{
++		s.item("doc.txt", "data"),
++	})
++	s.Empty(failed)
++	file := files[0]
++
++	s.NoError(os.Remove(volumes.PhysicalKey(volumes.FileSys, volumes.RefOf(file))))
++
++	removed, delFailed := volumes.DeleteBatch(ctx, s.cfg, []*volumes.File{file})
++	s.Empty(delFailed)
++	s.Len(removed, 1)
++	s.Equal(0, s.countFiles())
++	s.Equal(0, s.countOps())
++}
++
++// Test_Reconcile_AbortsInterruptedUpload simulates a crash after the object
++// was written but before metadata committed: the orphan staged object is
++// reaped and published data is untouched.
++func (s *VolumeLifecycleSuite) Test_Reconcile_AbortsInterruptedUpload() {
++	ctx := context.Background()
++
++	live, failed := volumes.UploadBatch(ctx, s.cfg, []volumes.UploadItem{
++		s.item("live.txt", "live"),
++	})
++	s.Empty(failed)
++
++	// Orphan staged object on disk with an old pending op, as if the process
++	// died right after writing it.
++	orphanDir := filepath.Join(s.tmpdir, "a0e"+s.envID.String(), "objects", "orphantoken")
++	s.Require().NoError(os.MkdirAll(orphanDir, 0775))
++	orphanPath := filepath.Join(orphanDir, "orphan.txt")
++	s.Require().NoError(os.WriteFile(orphanPath, []byte("orphan"), 0664))
++
++	_, err := s.conn.Exec(`
++		INSERT INTO volumes_ops (
++			env_id, op_type, status, file_name, file_size, mount_type,
++			object, created_at
++		)
++		VALUES ($1, 'upload', 'pending', 'orphan.txt', 6, $2, $3, $4)
++	`,
++		s.envID,
++		volumes.FileSys,
++		`{"path": "`+orphanDir+`", "name": "orphan.txt"}`,
++		time.Now().Add(-time.Hour),
++	)
++	s.NoError(err)
++
++	s.Require().NoError(volumes.ReconcileOps(ctx, s.cfg))
++
++	s.NoFileExists(orphanPath, "orphan object reaped")
++	s.Equal(1, s.countFiles(), "published row untouched")
++	s.Equal("live", s.download(live[0]))
++	s.Equal(0, s.countOps())
++}
++
++// Test_Reconcile_NeverDeletesReferencedObject verifies the safety rule: a
++// displaced object that still matches current metadata is preserved; the op
++// is retried later and only then completes.
++func (s *VolumeLifecycleSuite) Test_Reconcile_NeverDeletesReferencedObject() {
++	ctx := context.Background()
++
++	files, failed := volumes.UploadBatch(ctx, s.cfg, []volumes.UploadItem{
++		s.item("doc.txt", "live"),
++	})
++	s.Empty(failed)
++	file := files[0]
++	livePath := volumes.PhysicalKey(volumes.FileSys, volumes.RefOf(file))
++
++	// A committed replacement op that claims the currently live object as
++	// displaced. Recovery must trust the metadata, not the op.
++	_, err := s.conn.Exec(`
++		INSERT INTO volumes_ops (
++			env_id, op_type, status, file_id, file_name, file_size,
++			mount_type, object, replaced, created_at
++		)
++		VALUES ($1, 'upload', 'committed', $2, 'doc.txt', 4, $3, $4, $5, now())
++	`,
++		s.envID, file.ID,
++		volumes.FileSys,
++		`{"path": "`+filepath.Dir(livePath)+`", "name": "new.txt"}`,
++		`{"path": "`+file.Path+`", "name": "doc.txt"}`,
++	)
++	s.NoError(err)
++
++	s.Require().NoError(volumes.ReconcileOps(ctx, s.cfg))
++	s.FileExists(livePath, "referenced object must survive recovery")
++	s.Equal(1, s.countOps(), "op retained while its object is protected")
++
++	// Metadata moves away (row deleted): the object is now unreferenced and
++	// the op completes on the next run.
++	s.NoError(volumes.Store().RemoveFiles(ctx, []*volumes.File{file}, s.envID))
++	s.Require().NoError(volumes.ReconcileOps(ctx, s.cfg))
++	s.NoFileExists(livePath)
++	s.Equal(0, s.countOps())
++}
++
++// Test_Reconcile_RetryPendingDelete completes an interrupted delete after
++// restart: object removal first, metadata consumption second.
++func (s *VolumeLifecycleSuite) Test_Reconcile_RetryPendingDelete() {
++	ctx := context.Background()
++
++	files, failed := volumes.UploadBatch(ctx, s.cfg, []volumes.UploadItem{
++		s.item("doc.txt", "data"),
++	})
++	s.Empty(failed)
++	file := files[0]
++	objectPath := volumes.PhysicalKey(volumes.FileSys, volumes.RefOf(file))
++
++	_, err := s.conn.Exec(`
++		INSERT INTO volumes_ops (
++			env_id, op_type, status, file_id, file_name, file_size,
++			mount_type, object, created_at
++		)
++		VALUES ($1, 'delete', 'pending', $2, 'doc.txt', 4, $3, $4, now())
++	`,
++		s.envID, file.ID,
++		volumes.FileSys,
++		`{"path": "`+file.Path+`", "name": "doc.txt"}`,
++	)
++	s.NoError(err)
++
++	s.Require().NoError(volumes.ReconcileOps(ctx, s.cfg))
++
++	s.NoFileExists(objectPath)
++	s.Equal(0, s.countFiles())
++	s.Equal(0, s.countOps())
++}
++
++// Test_UploadBatch_IsPublicPreservedOnReplace verifies visibility is a
++// property of the row, not the upload: making a file public and replacing it
++// keeps it public under the same id and link.
++func (s *VolumeLifecycleSuite) Test_UploadBatch_IsPublicPreservedOnReplace() {
++	ctx := context.Background()
++
++	files, failed := volumes.UploadBatch(ctx, s.cfg, []volumes.UploadItem{
++		s.item("doc.txt", "v1"),
++	})
++	s.Empty(failed)
++	file := files[0]
++
++	s.NoError(volumes.Store().ChangeVisibility(ctx, file.ID, true))
++
++	files, failed = volumes.UploadBatch(ctx, s.cfg, []volumes.UploadItem{
++		s.item("doc.txt", "v2"),
++	})
++	s.Empty(failed)
++
++	rows, err := volumes.Store().SelectFiles(ctx, volumes.SelectFilesArgs{EnvID: s.envID})
++	s.NoError(err)
++	s.Len(rows, 1)
++	s.True(rows[0].IsPublic)
++	s.Equal(file.ID, rows[0].ID)
++	s.Equal("v2", s.download(rows[0]))
++}
++
++func TestVolumeLifecycleSuite(t *testing.T) {
++	suite.Run(t, &VolumeLifecycleSuite{})
++}
+diff --git a/src/ce/api/app/volumes/volume_model.go b/src/ce/api/app/volumes/volume_model.go
+index a7dde10..f95e1db 100644
+--- a/src/ce/api/app/volumes/volume_model.go
++++ b/src/ce/api/app/volumes/volume_model.go
+@@ -25,6 +25,16 @@ const (
+ 	HCloudOSS  = "hcloud:oss"
+ )
+ 
++const (
++	// objectsDir holds staged and published upload objects. Each upload gets
++	// a unique sub-directory, so replacing a file never overwrites the bytes
++	// a still-published row points at until the metadata transaction commits.
++	objectsDir = "objects"
++
++	// stagingTokenLength is the entropy of a staged object directory.
++	stagingTokenLength = 24
++)
++
+ var (
+ 	MaxUploadSize     = int64(50 << 20)  // 50 MB
+ 	UploadMemoryLimit = int64(100 << 20) // 100 MB
+@@ -144,37 +154,64 @@ func SanitizeUploadFilename(name string) (string, error) {
+ 	return cleaned, nil
+ }
+ 
+-// Upload a file to the destination specified by args.MountType.
+-func Upload(vc *admin.VolumesConfig, args UploadArgs) (*File, error) {
++// OpenUpload opens the multipart file and returns its sanitized logical name.
++// The caller is responsible for closing the returned reader.
++func OpenUpload(args UploadArgs) (multipart.File, string, error) {
+ 	file, err := args.FileHeader.Open()
+ 
+ 	if err != nil {
+-		return nil, err
++		return nil, "", err
+ 	}
+ 
+-	defer file.Close()
+-
+ 	fileName, err := SanitizeUploadFilename(utils.GetString(args.ContentDisposition["filename"], args.FileHeader.Name()))
+ 
+ 	if err != nil {
+-		return nil, err
++		file.Close()
++		return nil, "", err
+ 	}
+ 
+-	filePath := constructFilePath(args.AppID, args.EnvID)
++	return file, fileName, nil
++}
++
++// StagingRef returns the locator of a staged upload object before it is
++// written. Objects are flattened into a unique directory per upload so the
++// bytes a published row currently points at are never overwritten in place.
++func StagingRef(vc *admin.VolumesConfig, appID, envID types.ID, token, fileName string) ObjectRef {
++	objectDir := path.Join(constructFilePath(appID, envID), objectsDir, token)
+ 
++	switch vc.MountType {
++	case AWSS3:
++		return ObjectRef{
++			Path: path.Join(vc.BucketName, objectDir),
++			Name: physicalName(fileName),
++		}
++	default:
++		return ObjectRef{
++			Path: filepath.Join(vc.RootPath, filepath.FromSlash(objectDir)),
++			Name: physicalName(fileName),
++		}
++	}
++}
++
++// StageUpload writes the uploaded bytes to the given unpublished object
++// location. It does not create any metadata: callers must have registered an
++// upload op first and publish the returned file through Ops().PublishUpload.
++// Until that transaction commits, readers keep seeing the previous version.
++func StageUpload(vc *admin.VolumesConfig, args UploadArgs, token, fileName string, file multipart.File) (*File, error) {
+ 	opts := uploadArgs{
+-		file:        file,
+-		size:        args.FileHeader.Size(),
+-		envID:       args.EnvID,
+-		dstFileName: fileName,
+-		dstFilePath: filePath,
++		file:       file,
++		size:       args.FileHeader.Size(),
++		envID:      args.EnvID,
++		token:      token,
++		logicalName: fileName,
++		ref:        StagingRef(vc, args.AppID, args.EnvID, token, fileName),
+ 	}
+ 
+ 	switch vc.MountType {
+ 	case FileSys:
+-		return clientFilesys(vc).upload(opts)
++		return clientFilesys(vc).stage(opts)
+ 	case AWSS3:
+-		return clientAWS(vc).upload(opts)
++		return clientAWS(vc).stage(opts)
+ 	}
+ 
+ 	return nil, nil
+@@ -192,7 +229,22 @@ func Download(vc *admin.VolumesConfig, file *File) (io.ReadSeeker, error) {
+ 	return nil, nil
+ }
+ 
+-// Upload a file to the destination specified by args.MountType.
++// RemoveObject removes a single physical object. A missing object is treated
++// as success so deletes can be retried safely after a crash.
++func RemoveObject(vc *admin.VolumesConfig, ref ObjectRef) error {
++	file := ref.file()
++
++	switch vc.MountType {
++	case FileSys:
++		return clientFilesys(vc).removeOne(file)
++	case AWSS3:
++		return clientAWS(vc).removeOne(file)
++	}
++
++	return nil
++}
++
++// RemoveFiles removes files from the source.
+ // This function returns a list of files that are successfully removed.
+ // When encountered an error other than os.IsNotExist, returns immediately.
+ func RemoveFiles(vc *admin.VolumesConfig, files []*File) ([]*File, error) {
+@@ -206,6 +258,87 @@ func RemoveFiles(vc *admin.VolumesConfig, files []*File) ([]*File, error) {
+ 	return nil, nil
+ }
+ 
++// MountTypeOf returns the backend mount type recorded on a volumes row,
++// defaulting to the filesystem backend for legacy rows without metadata.
++func MountTypeOf(f *File) string {
++	if f.Metadata != nil {
++		if mountType, ok := f.Metadata["mountType"].(string); ok && mountType != "" {
++			return mountType
++		}
++	}
++
++	return FileSys
++}
++
++// RefOf returns the exact physical object locator of a published volumes row:
++// staged rows record their flattened object name in metadata, while legacy
++// rows encoded the whole (possibly nested) name in file_name.
++func RefOf(f *File) ObjectRef {
++	name := f.Name
++
++	if f.Metadata != nil {
++		if objectName, ok := f.Metadata["objectName"].(string); ok && objectName != "" {
++			name = objectName
++		}
++	}
++
++	return ObjectRef{Path: f.Path, Name: name}
++}
++
++// ObjectRefFromRow builds an object locator from raw volumes columns.
++func ObjectRefFromRow(filePath, logicalName string, metadata utils.Map) ObjectRef {
++	name := logicalName
++
++	if metadata != nil {
++		if objectName, ok := metadata["objectName"].(string); ok && objectName != "" {
++			name = objectName
++		}
++	}
++
++	return ObjectRef{Path: filePath, Name: name}
++}
++
++// physicalName flattens a logical name to its base component. Every staged
++// upload lives in its own unique directory, so nested logical names do not
++// need to preserve their folder structure in the object backend.
++func physicalName(fileName string) string {
++	return filepath.Base(filepath.FromSlash(fileName))
++}
++
++// PhysicalKey returns the backend-specific unique key of an object: the
++// absolute path for the filesystem mount and the bucket-relative key for S3.
++// Recovery compares keys to make sure it never removes a published object.
++func PhysicalKey(mountType string, ref ObjectRef) string {
++	switch mountType {
++	case AWSS3:
++		pieces := strings.SplitN(ref.Path, "/", 2)
++
++		if len(pieces) != 2 {
++			return ""
++		}
++
++		return path.Join(pieces[1], ref.Name)
++	default:
++		return filepath.Join(ref.Path, filepath.Base(ref.Name))
++	}
++}
++
++// metadataValue serialises row metadata for the jsonb column as a JSON string;
++// a []byte would be sent as bytea.
++func metadataValue(m utils.Map) any {
++	v, err := m.Value()
++
++	if err != nil {
++		return nil
++	}
++
++	if b, ok := v.([]byte); ok {
++		return string(b)
++	}
++
++	return v
++}
++
+ func constructFilePath(appID, envID types.ID) string {
+ 	return path.Join(fmt.Sprintf("a%se%s", appID, envID))
+ }
+diff --git a/src/ce/api/app/volumes/volume_ops_store.go b/src/ce/api/app/volumes/volume_ops_store.go
+new file mode 100644
+index 0000000..ee2d389
+--- /dev/null
++++ b/src/ce/api/app/volumes/volume_ops_store.go
+@@ -0,0 +1,471 @@
++package volumes
++
++import (
++	"context"
++	"database/sql"
++	"encoding/json"
++	"time"
++
++	"github.com/stormkit-io/stormkit-io/src/lib/database"
++	"github.com/stormkit-io/stormkit-io/src/lib/types"
++	"github.com/stormkit-io/stormkit-io/src/lib/utils"
++)
++
++const (
++	OpUpload = "upload"
++	OpDelete = "delete"
++
++	OpPending   = "pending"
++	OpCommitted = "committed"
++	OpFailed    = "failed"
++)
++
++// ObjectRef locates a physical object in the configured backend. It mirrors
++// the (file_path, file_name) pair stored on volumes rows so the same backend
++// code can download or remove it.
++type ObjectRef struct {
++	Path string `json:"path"`
++	Name string `json:"name"`
++}
++
++func (r ObjectRef) file() *File {
++	return &File{Path: r.Path, Name: r.Name}
++}
++
++func (r ObjectRef) jsonValue() any {
++	b, _ := json.Marshal(r)
++	return string(b)
++}
++
++// Op is a registered upload or delete operation. The row exists before the
++// backend is touched and is only removed once the operation and every cleanup
++// it implies have completed, which is what makes crash recovery deterministic.
++type Op struct {
++	ID        types.ID
++	EnvID     types.ID
++	Type      string
++	Status    string
++	FileID    types.ID
++	FileName  string
++	FileSize  int64
++	MountType string
++	Object    ObjectRef
++	Replaced  *ObjectRef
++	Error     sql.NullString
++	CreatedAt utils.Unix
++	UpdatedAt utils.Unix
++}
++
++const opColumns = `
++	op_id, env_id, op_type, status, file_id, file_name,
++	file_size, mount_type, object, replaced, error,
++	created_at, updated_at
++`
++
++type opsStore struct {
++	*database.Store
++}
++
++// Ops returns a store for volume lifecycle operations.
++func Ops() *opsStore {
++	return &opsStore{Store: database.NewStore()}
++}
++
++func scanOp(s interface {
++	Scan(dest ...any) error
++}) (*Op, error) {
++	var (
++		op          Op
++		fileID      sql.NullInt64
++		fileName    sql.NullString
++		errMsg      sql.NullString
++		objectRaw   []byte
++		replacedRaw []byte
++	)
++
++	if err := s.Scan(
++		&op.ID, &op.EnvID, &op.Type, &op.Status, &fileID, &fileName,
++		&op.FileSize, &op.MountType, &objectRaw, &replacedRaw, &errMsg,
++		&op.CreatedAt, &op.UpdatedAt,
++	); err != nil {
++		return nil, err
++	}
++
++	if fileID.Valid {
++		op.FileID = types.ID(fileID.Int64)
++	}
++
++	op.FileName = fileName.String
++	op.Error = errMsg
++
++	if err := json.Unmarshal(objectRaw, &op.Object); err != nil {
++		return nil, err
++	}
++
++	if len(replacedRaw) > 0 {
++		var replaced ObjectRef
++
++		if err := json.Unmarshal(replacedRaw, &replaced); err != nil {
++			return nil, err
++		}
++
++		op.Replaced = &replaced
++	}
++
++	return &op, nil
++}
++
++// CreateOp registers an operation before the backend is touched.
++func (s *opsStore) CreateOp(ctx context.Context, op *Op) error {
++	row := s.Conn.QueryRowContext(ctx, `
++		INSERT INTO volumes_ops (
++			env_id, op_type, status, file_id, file_name,
++			file_size, mount_type, object
++		)
++		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
++		RETURNING op_id, created_at
++	`,
++		op.EnvID, op.Type, op.Status, nullableID(op.FileID), nullableString(op.FileName),
++		op.FileSize, op.MountType, op.Object.jsonValue(),
++	)
++
++	if err := row.Scan(&op.ID, &op.CreatedAt); err != nil {
++		return err
++	}
++
++	return nil
++}
++
++// DeleteOp removes the operation row.
++func (s *opsStore) DeleteOp(ctx context.Context, opID types.ID) error {
++	_, err := s.Conn.ExecContext(ctx, `DELETE FROM volumes_ops WHERE op_id = $1`, opID)
++	return err
++}
++
++// FailOp marks the operation as failed and stores the error message. Failed
++// uploads leave no metadata behind; their staged object is reaped by
++// reconciliation. Failed deletes are retried because their rows are still
++// downloadable.
++func (s *opsStore) FailOp(ctx context.Context, opID types.ID, errMsg string) error {
++	_, err := s.Conn.ExecContext(ctx, `
++		UPDATE volumes_ops
++		SET status = $2, error = $3, updated_at = now() AT TIME ZONE 'UTC'
++		WHERE op_id = $1
++	`, opID, OpFailed, truncateErr(errMsg))
++	return err
++}
++
++// PublishUpload flips an upload to its single observable state: within one
++// transaction the volumes row starts pointing at the staged object and the
++// operation becomes committed, recording the object it displaced (if any).
++// Concurrent readers see either the old row or the new row, never a mix.
++// It returns the published file id (stable across replacements so public
++// links keep working) and the displaced object (nil for new files).
++func (s *opsStore) PublishUpload(ctx context.Context, op *Op, file *File) (types.ID, *ObjectRef, error) {
++	tx, err := s.Conn.BeginTx(ctx, nil)
++
++	if err != nil {
++		return 0, nil, err
++	}
++
++	defer tx.Rollback()
++
++	var (
++		fileID   types.ID
++		replaced *ObjectRef
++	)
++
++	// Two uploads of the same new name can both find no row before either
++	// inserts; the loser of the unique constraint retries as an update so the
++	// request still publishes instead of surfacing a conflict.
++	for attempt := 0; attempt < 2; attempt++ {
++		var (
++			oldPath sql.NullString
++			oldName sql.NullString
++			oldMeta utils.Map
++		)
++
++		scanErr := tx.QueryRowContext(ctx, `
++			SELECT file_path, file_name, file_metadata
++			FROM volumes
++			WHERE env_id = $1 AND file_name = $2
++			FOR UPDATE
++		`, file.EnvID, file.Name).Scan(&oldPath, &oldName, &oldMeta)
++
++		if scanErr == sql.ErrNoRows {
++			scanErr = tx.QueryRowContext(ctx, `
++				INSERT INTO volumes (
++					file_name, file_path, file_size, file_metadata,
++					is_public, env_id, created_at
++				)
++				VALUES ($1, $2, $3, $4, $5, $6, $7)
++				RETURNING file_id
++			`,
++				file.Name, file.Path, file.Size, metadataValue(file.Metadata),
++				file.IsPublic, file.EnvID, file.CreatedAt,
++			).Scan(&fileID)
++
++			if scanErr != nil && database.IsDuplicate(scanErr) && attempt == 0 {
++				continue
++			}
++		} else if scanErr == nil {
++			if oldPath.Valid && oldName.Valid {
++				r := ObjectRefFromRow(oldPath.String, oldName.String, oldMeta)
++				replaced = &r
++			}
++
++			scanErr = tx.QueryRowContext(ctx, `
++				UPDATE volumes
++				SET file_path = $1,
++					file_size = $2,
++					file_metadata = $3,
++					updated_at = $4
++				WHERE env_id = $5 AND file_name = $6
++				RETURNING file_id
++			`,
++				file.Path, file.Size, metadataValue(file.Metadata),
++				file.CreatedAt, file.EnvID, file.Name,
++			).Scan(&fileID)
++		}
++
++		if scanErr != nil {
++			return 0, nil, scanErr
++		}
++
++		break
++	}
++
++	if _, err := tx.ExecContext(ctx, `
++		UPDATE volumes_ops
++		SET status = $2,
++			file_id = $3,
++			replaced = $4,
++			updated_at = $5
++		WHERE op_id = $1
++	`,
++		op.ID, OpCommitted, fileID, jsonRef(replaced), file.CreatedAt,
++	); err != nil {
++		return 0, nil, err
++	}
++
++	if err := tx.Commit(); err != nil {
++		return 0, nil, err
++	}
++
++	op.Status = OpCommitted
++	op.FileID = fileID
++	op.Replaced = replaced
++	file.ID = fileID
++
++	return fileID, replaced, nil
++}
++
++// CommitDelete finishes a delete operation. The volumes row is deleted only
++// while it still points at the exact object the operation removed, so a
++// replacement that committed concurrently (repointing the row at a new
++// object) is never taken down. The op row is consumed in the same
++// transaction.
++func (s *opsStore) CommitDelete(ctx context.Context, op *Op) error {
++	tx, err := s.Conn.BeginTx(ctx, nil)
++
++	if err != nil {
++		return err
++	}
++
++	defer tx.Rollback()
++
++	if _, err := tx.ExecContext(ctx, `
++		DELETE FROM volumes
++		WHERE file_id = $1 AND env_id = $2 AND file_path = $3 AND file_name = $4
++	`, op.FileID, op.EnvID, op.Object.Path, op.FileName); err != nil {
++		return err
++	}
++
++	if _, err := tx.ExecContext(ctx, `DELETE FROM volumes_ops WHERE op_id = $1`, op.ID); err != nil {
++		return err
++	}
++
++	return tx.Commit()
++}
++
++func (s *opsStore) queryOps(ctx context.Context, query string, args ...any) ([]*Op, error) {
++	rows, err := s.Conn.QueryContext(ctx, query, args...)
++
++	if err != nil {
++		return nil, err
++	}
++
++	defer rows.Close()
++
++	ops := []*Op{}
++
++	for rows.Next() {
++		op, err := scanOp(rows)
++
++		if err != nil {
++			return nil, err
++		}
++
++		ops = append(ops, op)
++	}
++
++	return ops, rows.Err()
++}
++
++// StalePendingUploadOps returns upload operations still pending after the
++// given timestamp. Younger rows belong to requests that may still be in
++// flight on another node and must not be touched.
++func (s *opsStore) StalePendingUploadOps(ctx context.Context, before time.Time, limit int) ([]*Op, error) {
++	return s.queryOps(ctx, `
++		SELECT `+opColumns+`
++		FROM volumes_ops
++		WHERE op_type = $1 AND status = $2 AND created_at < $3
++		ORDER BY op_id ASC
++		LIMIT $4
++	`, OpUpload, OpPending, before, limit)
++}
++
++// RetryableDeleteOps returns delete operations that still need their physical
++// object and row removed. Pending rows may be in flight; repeating the
++// idempotent remove + conditional delete is harmless.
++func (s *opsStore) RetryableDeleteOps(ctx context.Context, limit int) ([]*Op, error) {
++	return s.queryOps(ctx, `
++		SELECT `+opColumns+`
++		FROM volumes_ops
++		WHERE op_type = $1 AND status IN ($2, $3)
++		ORDER BY op_id ASC
++		LIMIT $4
++	`, OpDelete, OpPending, OpFailed, limit)
++}
++
++// CommittedUploadOps returns committed uploads whose displaced object still
++// has to be cleaned up (replaced IS NOT NULL), followed by rows that are
++// fully done and only need to be removed.
++func (s *opsStore) CommittedUploadOps(ctx context.Context, limit int) ([]*Op, error) {
++	return s.queryOps(ctx, `
++		SELECT `+opColumns+`
++		FROM volumes_ops
++		WHERE op_type = $1 AND status = $2
++		ORDER BY op_id ASC
++		LIMIT $3
++	`, OpUpload, OpCommitted, limit)
++}
++
++// FailedUploadOps returns aborted uploads whose staged object must be reaped.
++func (s *opsStore) FailedUploadOps(ctx context.Context, limit int) ([]*Op, error) {
++	return s.queryOps(ctx, `
++		SELECT `+opColumns+`
++		FROM volumes_ops
++		WHERE op_type = $1 AND status = $2
++		ORDER BY op_id ASC
++		LIMIT $3
++	`, OpUpload, OpFailed, limit)
++}
++
++// OpsByEnv returns every operation registered for an environment, used while
++// purging a deleted environment.
++func (s *opsStore) OpsByEnv(ctx context.Context, envID types.ID, limit int) ([]*Op, error) {
++	return s.queryOps(ctx, `
++		SELECT `+opColumns+`
++		FROM volumes_ops
++		WHERE env_id = $1
++		ORDER BY op_id ASC
++		LIMIT $2
++	`, envID, limit)
++}
++
++// DeleteOpsByEnv removes all operation rows of an environment.
++func (s *opsStore) DeleteOpsByEnv(ctx context.Context, envID types.ID) error {
++	_, err := s.Conn.ExecContext(ctx, `DELETE FROM volumes_ops WHERE env_id = $1`, envID)
++	return err
++}
++
++// IsObjectProtected reports whether the object is either staged by an
++// operation that may still commit or referenced by a published volumes row.
++// Recovery never removes a protected object. Rows sharing the object's
++// directory are resolved to their physical key in Go so that legacy layouts
++// and the flattened staged names compare correctly; the check is deliberately
++// conservative (an extra directory match only delays cleanup, it never
++// deletes a live object).
++func (s *opsStore) IsObjectProtected(ctx context.Context, mountType string, ref ObjectRef) (bool, error) {
++	var pending int
++
++	if err := s.Conn.QueryRowContext(ctx, `
++		SELECT COUNT(*)
++		FROM volumes_ops
++		WHERE op_type = $1 AND status = $2 AND object @> $3::jsonb
++	`, OpUpload, OpPending, ref.jsonValue()).Scan(&pending); err != nil {
++		return false, err
++	}
++
++	if pending > 0 {
++		return true, nil
++	}
++
++	rows, err := s.Conn.QueryContext(ctx, `
++		SELECT file_name, file_metadata
++		FROM volumes
++		WHERE file_path = $1
++	`, ref.Path)
++
++	if err != nil {
++		return false, err
++	}
++
++	defer rows.Close()
++
++	targetKey := PhysicalKey(mountType, ref)
++
++	for rows.Next() {
++		var (
++			logicalName string
++			metadata    utils.Map
++		)
++
++		if err := rows.Scan(&logicalName, &metadata); err != nil {
++			return false, err
++		}
++
++		rowKey := PhysicalKey(mountType, ObjectRefFromRow(ref.Path, logicalName, metadata))
++
++		if rowKey != "" && rowKey == targetKey {
++			return true, nil
++		}
++	}
++
++	return false, rows.Err()
++}
++
++func nullableID(id types.ID) any {
++	if id == 0 {
++		return nil
++	}
++
++	return id
++}
++
++func nullableString(v string) any {
++	if v == "" {
++		return nil
++	}
++
++	return v
++}
++
++func jsonRef(ref *ObjectRef) any {
++	if ref == nil {
++		return nil
++	}
++
++	return ref.jsonValue()
++}
++
++func truncateErr(msg string) string {
++	const max = 2000
++
++	if len(msg) > max {
++		return msg[:max]
++	}
++
++	return msg
++}
+diff --git a/src/ce/api/app/volumes/volume_reconcile.go b/src/ce/api/app/volumes/volume_reconcile.go
+new file mode 100644
+index 0000000..e5aa362
+--- /dev/null
++++ b/src/ce/api/app/volumes/volume_reconcile.go
+@@ -0,0 +1,272 @@
++package volumes
++
++import (
++	"context"
++	"time"
++
++	"github.com/stormkit-io/stormkit-io/src/ce/api/admin"
++	"github.com/stormkit-io/stormkit-io/src/lib/slog"
++	"github.com/stormkit-io/stormkit-io/src/lib/types"
++	"go.uber.org/zap"
++)
++
++var (
++	// reconcilePendingGrace is how long an upload may remain in progress
++	// before reconciliation treats it as interrupted. It must comfortably
++	// exceed the slowest allowed upload (50MB); it is a variable so tests do
++	// not wait for it.
++	reconcilePendingGrace = 15 * time.Minute
++
++	// reconcileBatchSize bounds how many rows one reconciliation pass handles.
++	reconcileBatchSize = 100
++
++	// reconcileMaxPasses bounds a single run; the scheduler re-runs regularly
++	// so leftovers are picked up on the next tick.
++	reconcileMaxPasses = 10
++)
++
++// ReconcileOps drives interrupted volume operations to a deterministic state
++// after failures or restarts:
++//
++//   - uploads whose process died before the metadata transaction committed are
++//     aborted: no row ever referenced their staged object, so the bytes are
++//     removed and any reader keeps seeing the previous version;
++//   - committed replacements whose displaced object could not be removed
++//     inline get it removed now, provided no current metadata references it;
++//   - failed uploads have their staged bytes reaped;
++//   - pending/failed deletes are retried: object first, metadata row second.
++//
++// It is safe to run repeatedly and concurrently with live traffic.
++func ReconcileOps(ctx context.Context, vc *admin.VolumesConfig) error {
++	if vc == nil {
++		return nil
++	}
++
++	store := Ops()
++
++	for pass := 0; pass < reconcileMaxPasses; pass++ {
++		progress := false
++
++		aborted, err := abortStaleUploads(ctx, store, vc)
++		if err != nil {
++			return err
++		}
++
++		retried, err := retryDeletes(ctx, store, vc)
++		if err != nil {
++			return err
++		}
++
++		cleaned, err := cleanCommittedUploads(ctx, store, vc)
++		if err != nil {
++			return err
++		}
++
++		reaped, err := reapFailedUploads(ctx, store, vc)
++		if err != nil {
++			return err
++		}
++
++		progress = aborted || retried || cleaned || reaped
++
++		if !progress {
++			return nil
++		}
++	}
++
++	return nil
++}
++
++// abortStaleUploads fails pending uploads older than the grace period (their
++// request is gone) and removes their now-unprotected staged object.
++func abortStaleUploads(ctx context.Context, store *opsStore, vc *admin.VolumesConfig) (bool, error) {
++	ops, err := store.StalePendingUploadOps(ctx, time.Now().Add(-reconcilePendingGrace), reconcileBatchSize)
++
++	if err != nil {
++		return false, err
++	}
++
++	progress := false
++
++	for _, op := range ops {
++		// Flip out of pending first: that releases the protection the object
++		// receives as an in-flight upload.
++		if err := store.FailOp(ctx, op.ID, "interrupted upload aborted after restart"); err != nil {
++			slog.Errorf("cannot abort stale volume upload op %d: %s", op.ID, err.Error())
++			continue
++		}
++
++		gone, err := removeIfUnreferenced(ctx, store, vc, op.Object)
++
++		if err != nil {
++			slog.Errorf("cannot verify staged object of stale volume upload op %d: %s", op.ID, err.Error())
++			continue
++		}
++
++		if !gone {
++			// The object is referenced by current metadata; leave it in
++			// place and keep the row for the next run.
++			continue
++		}
++
++		if err := store.DeleteOp(ctx, op.ID); err != nil {
++			slog.Errorf("cannot delete aborted volume upload op %d: %s", op.ID, err.Error())
++			continue
++		}
++
++		slog.Debug(slog.LogOpts{
++			Msg:   "aborted stale volume upload",
++			Level: slog.DL1,
++			Payload: []zap.Field{
++				zap.Int64("op_id", int64(op.ID)),
++				zap.Int64("env_id", int64(op.EnvID)),
++				zap.String("name", op.FileName),
++			},
++		})
++
++		progress = true
++	}
++
++	return progress, nil
++}
++
++// retryDeletes completes pending and failed delete operations: the object is
++// removed first and the row is only consumed afterwards, so a failing backend
++// never strands an undownloadable empty row.
++func retryDeletes(ctx context.Context, store *opsStore, vc *admin.VolumesConfig) (bool, error) {
++	ops, err := store.RetryableDeleteOps(ctx, reconcileBatchSize)
++
++	if err != nil {
++		return false, err
++	}
++
++	progress := false
++
++	for _, op := range ops {
++		if err := RemoveObject(vc, op.Object); err != nil {
++			slog.Errorf("cannot remove object of pending volume delete op %d: %s", op.ID, err.Error())
++			continue
++		}
++
++		if err := store.CommitDelete(ctx, op); err != nil {
++			slog.Errorf("cannot commit pending volume delete op %d: %s", op.ID, err.Error())
++			continue
++		}
++
++		progress = true
++	}
++
++	return progress, nil
++}
++
++// cleanCommittedUploads removes objects displaced by committed replacements
++// and consumes the finished op rows. Objects still referenced by current
++// metadata are left for a later run.
++func cleanCommittedUploads(ctx context.Context, store *opsStore, vc *admin.VolumesConfig) (bool, error) {
++	ops, err := store.CommittedUploadOps(ctx, reconcileBatchSize)
++
++	if err != nil {
++		return false, err
++	}
++
++	progress := false
++
++	for _, op := range ops {
++		if op.Replaced != nil {
++			gone, err := removeIfUnreferenced(ctx, store, vc, *op.Replaced)
++
++			if err != nil {
++				slog.Errorf("cannot verify displaced object of volume upload op %d: %s", op.ID, err.Error())
++				continue
++			}
++
++			if !gone {
++				continue
++			}
++		}
++
++		if err := store.DeleteOp(ctx, op.ID); err != nil {
++			slog.Errorf("cannot delete committed volume upload op %d: %s", op.ID, err.Error())
++			continue
++		}
++
++		progress = true
++	}
++
++	return progress, nil
++}
++
++// reapFailedUploads removes staged objects left behind by failed uploads and
++// consumes their op rows.
++func reapFailedUploads(ctx context.Context, store *opsStore, vc *admin.VolumesConfig) (bool, error) {
++	ops, err := store.FailedUploadOps(ctx, reconcileBatchSize)
++
++	if err != nil {
++		return false, err
++	}
++
++	progress := false
++
++	for _, op := range ops {
++		gone, err := removeIfUnreferenced(ctx, store, vc, op.Object)
++
++		if err != nil {
++			slog.Errorf("cannot verify staged object of failed volume upload op %d: %s", op.ID, err.Error())
++			continue
++		}
++
++		if !gone {
++			continue
++		}
++
++		if err := store.DeleteOp(ctx, op.ID); err != nil {
++			slog.Errorf("cannot delete failed volume upload op %d: %s", op.ID, err.Error())
++			continue
++		}
++
++		progress = true
++	}
++
++	return progress, nil
++}
++
++// PurgeEnvOps removes every operation object of a soft-deleted environment
++// and consumes its op rows. It runs after the environment's volumes rows were
++// purged, so no live metadata can reference these objects anymore.
++func PurgeEnvOps(ctx context.Context, vc *admin.VolumesConfig, envID types.ID) error {
++	store := Ops()
++
++	for {
++		ops, err := store.OpsByEnv(ctx, envID, reconcileBatchSize)
++
++		if err != nil {
++			return err
++		}
++
++		if len(ops) == 0 {
++			return nil
++		}
++
++		for _, op := range ops {
++			refs := []ObjectRef{op.Object}
++
++			if op.Replaced != nil {
++				refs = append(refs, *op.Replaced)
++			}
++
++			for _, ref := range refs {
++				if err := RemoveObject(vc, ref); err != nil {
++					return err
++				}
++			}
++
++			if err := store.DeleteOp(ctx, op.ID); err != nil {
++				return err
++			}
++		}
++
++		if len(ops) < reconcileBatchSize {
++			return nil
++		}
++	}
++}
+diff --git a/src/ce/api/app/volumes/volumeshandlers/handler_volumes_del.go b/src/ce/api/app/volumes/volumeshandlers/handler_volumes_del.go
+index 3427ec9..783789f 100644
+--- a/src/ce/api/app/volumes/volumeshandlers/handler_volumes_del.go
++++ b/src/ce/api/app/volumes/volumeshandlers/handler_volumes_del.go
+@@ -57,20 +57,21 @@ func HandlerVolumesDel(req *app.RequestContext) *shttp.Response {
+ 		return shttp.Error(err)
+ 	}
+ 
+-	removedFiles, err := volumes.RemoveFiles(config.VolumesConfig, files)
++	// Objects are removed first; each file is committed independently, so a
++	// failed physical removal keeps a downloadable, retryable row and does not
++	// strand the files that were processed before it.
++	removedFiles, failedFiles := volumes.DeleteBatch(ctx, config.VolumesConfig, files)
+ 
+-	if err != nil {
+-		return shttp.Error(err)
++	data := map[string]any{
++		"removed": toJSON(removedFiles),
+ 	}
+ 
+-	if err = store.RemoveFiles(ctx, removedFiles, req.EnvID); err != nil {
+-		return shttp.Error(err)
++	if len(failedFiles) > 0 {
++		data["failed"] = failedFiles
+ 	}
+ 
+ 	return &shttp.Response{
+ 		Status: http.StatusOK,
+-		Data: map[string]any{
+-			"removed": toJSON(removedFiles),
+-		},
++		Data:   data,
+ 	}
+ }
+diff --git a/src/ce/api/app/volumes/volumeshandlers/handler_volumes_lifecycle_test.go b/src/ce/api/app/volumes/volumeshandlers/handler_volumes_lifecycle_test.go
+new file mode 100644
+index 0000000..747fcfc
+--- /dev/null
++++ b/src/ce/api/app/volumes/volumeshandlers/handler_volumes_lifecycle_test.go
+@@ -0,0 +1,287 @@
++package volumeshandlers_test
++
++import (
++	"context"
++	"fmt"
++	"net/http"
++	"net/url"
++	"os"
++	"path/filepath"
++	"strings"
++	"testing"
++
++	"github.com/golang-jwt/jwt/v5"
++	"github.com/stormkit-io/stormkit-io/src/ce/api/admin"
++	"github.com/stormkit-io/stormkit-io/src/ce/api/app/volumes"
++	"github.com/stormkit-io/stormkit-io/src/ce/api/app/volumes/volumeshandlers"
++	"github.com/stormkit-io/stormkit-io/src/ce/api/user"
++	"github.com/stormkit-io/stormkit-io/src/ce/api/user/usertest"
++	"github.com/stormkit-io/stormkit-io/src/lib/database/databasetest"
++	"github.com/stormkit-io/stormkit-io/src/lib/factory"
++	"github.com/stormkit-io/stormkit-io/src/lib/shttp"
++	"github.com/stormkit-io/stormkit-io/src/lib/shttp/shttptest"
++	"github.com/stormkit-io/stormkit-io/src/lib/types"
++	"github.com/stormkit-io/stormkit-io/src/lib/utils"
++	"github.com/stretchr/testify/suite"
++)
++
++// HandlerVolumesLifecycleSuite covers the end-to-end invariant of the volume
++// file lifecycle: after a same-name replacement commits, list, download,
++// public-file and capacity stat all resolve to the same version, and a
++// failing physical delete keeps a retryable row instead of an empty one.
++type HandlerVolumesLifecycleSuite struct {
++	suite.Suite
++	*factory.Factory
++	conn   databasetest.TestDB
++	tmpdir string
++}
++
++func (s *HandlerVolumesLifecycleSuite) BeforeTest(suiteName, _ string) {
++	s.conn = databasetest.InitTx(suiteName)
++	s.Factory = factory.New(s.conn)
++	admin.ResetCache(context.Background())
++	admin.SetMockLicense()
++	volumes.CachedFileSys = nil
++
++	// Sequences reset per transaction, so env ids repeat across tests; keep
++	// the physical backing isolated too.
++	tmpDir, err := os.MkdirTemp("", "tmp-volumes-lifecycle-")
++	s.Require().NoError(err)
++	s.tmpdir = tmpDir
++
++	s.NoError(admin.Store().UpsertConfig(context.Background(), admin.InstanceConfig{
++		VolumesConfig: &admin.VolumesConfig{
++			MountType: volumes.FileSys,
++			RootPath:  s.tmpdir,
++		},
++	}))
++}
++
++func (s *HandlerVolumesLifecycleSuite) AfterTest(_, _ string) {
++	s.conn.CloseTx()
++	admin.ResetMockLicense()
++	os.RemoveAll(s.tmpdir)
++}
++
++func (s *HandlerVolumesLifecycleSuite) handler() http.Handler {
++	return shttp.NewRouter().RegisterService(volumeshandlers.Services).Router().Handler()
++}
++
++func (s *HandlerVolumesLifecycleSuite) upload(usrID, appID, envID types.ID, name, content string) map[string]any {
++	requestBody, contentType, err := shttptest.MultipartForm(map[string][]byte{
++		"appId": []byte(appID.String()),
++		"envId": []byte(envID.String()),
++	}, map[string][]shttptest.UploadFile{
++		"files": {{Name: name, Data: content}},
++	})
++	s.Require().NoError(err)
++
++	response := shttptest.RequestWithHeaders(
++		s.handler(), shttp.MethodPost, "/volumes", requestBody,
++		map[string]string{
++			"Content-Type":  contentType,
++			"Authorization": usertest.Authorization(usrID),
++		},
++	)
++	if response.Code != http.StatusOK {
++		s.T().Fatalf("upload failed: code=%d body=%s", response.Code, response.String())
++	}
++
++	files := response.Map()["files"].([]any)
++	s.Require().Len(files, 1)
++
++	return files[0].(map[string]any)
++}
++
++func (s *HandlerVolumesLifecycleSuite) setVisibility(usrID, appID, envID, fileID types.ID, visibility string) {
++	response := shttptest.RequestWithHeaders(
++		s.handler(), shttp.MethodPost,
++		"/volumes/visibility",
++		map[string]any{
++			"appId":      appID.String(),
++			"envId":      envID.String(),
++			"fileId":     fileID.String(),
++			"visibility": visibility,
++		},
++		map[string]string{"Authorization": usertest.Authorization(usrID)},
++	)
++	s.Require().Equal(http.StatusOK, response.Code, response.String())
++}
++
++func (s *HandlerVolumesLifecycleSuite) fileByID(envID, fileID types.ID) *volumes.File {
++	rows, err := volumes.Store().SelectFiles(context.Background(), volumes.SelectFilesArgs{
++		EnvID:  envID,
++		FileID: []types.ID{fileID},
++	})
++	s.Require().NoError(err)
++	s.Require().Len(rows, 1)
++
++	return rows[0]
++}
++
++// countRegularFiles walks the environment's object prefix and counts the
++// physical objects it still contains.
++func (s *HandlerVolumesLifecycleSuite) countRegularFiles(appID, envID types.ID) int {
++	count := 0
++	root := filepath.Join(s.tmpdir, fmt.Sprintf("a%se%s", appID, envID))
++
++	s.NoError(filepath.Walk(root, func(_ string, info os.FileInfo, err error) error {
++		if err == nil && !info.IsDir() {
++			count++
++		}
++
++		return nil
++	}))
++
++	return count
++}
++
++// Test_Replacement_AllViewsPointAtSameVersion verifies the single-version
++// publication guarantee across every read path.
++func (s *HandlerVolumesLifecycleSuite) Test_Replacement_AllViewsPointAtSameVersion() {
++	usr := s.MockUser()
++	app := s.MockApp(usr)
++	env := s.MockEnv(app)
++
++	first := s.upload(usr.ID, app.ID, env.ID, "doc.txt", "v1")
++	fileID := utils.StringToID(first["id"].(string))
++
++	// Public links derive from the stable file id and must survive replacement.
++	s.setVisibility(usr.ID, app.ID, env.ID, fileID, "public")
++
++	v1 := s.fileByID(env.ID, fileID)
++	v1Path := volumes.PhysicalKey(volumes.FileSys, volumes.RefOf(v1))
++	s.FileExists(v1Path)
++	linkV1 := v1.PublicLink()
++
++	// Replace with content of a different length so a stale size would be
++	// observable immediately.
++	second := s.upload(usr.ID, app.ID, env.ID, "doc.txt", "second-version")
++	s.Equal(first["id"], second["id"], "file id must stay stable")
++
++	// List points at the new version.
++	response := shttptest.RequestWithHeaders(
++		s.handler(), shttp.MethodGet,
++		fmt.Sprintf("/volumes?appId=%s&envId=%s", app.ID.String(), env.ID.String()),
++		nil,
++		map[string]string{"Authorization": usertest.Authorization(usr.ID)},
++	)
++	s.Equal(http.StatusOK, response.Code)
++
++	listed := response.Map()["files"].([]any)[0].(map[string]any)
++	s.Equal(float64(len("second-version")), listed["size"])
++	s.Equal(true, listed["isPublic"], "visibility is preserved by replacement")
++
++	// Encryption uses a random nonce, so compare the decoded token: the
++	// stable file id keeps the public link pointing at the same file.
++	listedLink, ok := listed["publicLink"].(string)
++	s.Require().True(ok)
++	s.Equal(
++		utils.DecryptToString(strings.TrimPrefix(linkV1, admin.MustConfig().ApiURL("/volumes/file/"))),
++		utils.DecryptToString(strings.TrimPrefix(listedLink, admin.MustConfig().ApiURL("/volumes/file/"))),
++		"public link must reference the same file id after replacement",
++	)
++
++	// Capacity stat points at the new version.
++	response = shttptest.RequestWithHeaders(
++		s.handler(), shttp.MethodGet,
++		fmt.Sprintf("/volumes/size?appId=%s&envId=%s", app.ID.String(), env.ID.String()),
++		nil,
++		map[string]string{"Authorization": usertest.Authorization(usr.ID)},
++	)
++	s.Equal(http.StatusOK, response.Code)
++	s.JSONEq(fmt.Sprintf(`{"size": %d}`, len("second-version")), response.String())
++
++	// Authenticated download serves the new bytes.
++	token, err := user.JWT(user.JWTParams{Purpose: user.PurposeVolumeDownload, Claims: jwt.MapClaims{
++		"token":  strings.Replace(usertest.Authorization(usr.ID), "Bearer ", "", 1),
++		"appId":  app.ID.String(),
++		"envId":  env.ID.String(),
++		"fileId": fileID.String(),
++	}})
++	s.NoError(err)
++
++	response = shttptest.RequestWithHeaders(
++		s.handler(), shttp.MethodGet,
++		fmt.Sprintf("/volumes/download?token=%s", token),
++		nil, nil,
++	)
++	downloadBody := response.String()
++	s.Equal(http.StatusOK, response.Code, downloadBody)
++	s.Equal("second-version", downloadBody)
++
++	// Public file serves the new bytes through the same stable link.
++	parsed, err := url.Parse(linkV1)
++	s.NoError(err)
++
++	response = shttptest.RequestWithHeaders(s.handler(), shttp.MethodGet, parsed.Path, nil, nil)
++	publicBody := response.String()
++	s.Equal(http.StatusOK, response.Code, publicBody)
++	s.Equal("second-version", publicBody)
++
++	// The displaced object is gone, only the live version occupies space.
++	s.Equal(1, s.countRegularFiles(app.ID, env.ID), "old object must be removed after replacement")
++	s.NoFileExists(v1Path)
++}
++
++// Test_Delete_PhysicalFailureIsRetryable verifies a failed physical delete
++// reports the file under "failed" and leaves its row downloadable; a later
++// recovery attempt consumes both object and row.
++func (s *HandlerVolumesLifecycleSuite) Test_Delete_PhysicalFailureIsRetryable() {
++	usr := s.MockUser()
++	app := s.MockApp(usr)
++	env := s.MockEnv(app)
++
++	uploaded := s.upload(usr.ID, app.ID, env.ID, "doc.txt", "v1")
++	fileID := utils.StringToID(uploaded["id"].(string))
++	originalPath := s.fileByID(env.ID, fileID).Path
++
++	// Repoint at a location where physical removal deterministically fails
++	// (ENOTDIR on /dev/null), independently of process privileges.
++	_, err := s.conn.Exec(`UPDATE volumes SET file_path = $2 WHERE file_id = $1`, fileID, "/dev/null")
++	s.Require().NoError(err)
++
++	response := shttptest.RequestWithHeaders(
++		s.handler(), shttp.MethodDelete,
++		fmt.Sprintf("/volumes?appId=%s&envId=%s&id=%s", app.ID.String(), env.ID.String(), fileID.String()),
++		nil,
++		map[string]string{"Authorization": usertest.Authorization(usr.ID)},
++	)
++	body := response.Map()
++
++	if response.Code != http.StatusOK {
++		s.T().Fatalf("delete failed: code=%d body=%v", response.Code, body)
++	}
++
++	s.Contains(body["failed"].(map[string]any), fileID.String())
++	s.Empty(body["removed"])
++
++	// Row remains: metadata is still retryable instead of an empty row.
++	s.NotNil(s.fileByID(env.ID, fileID))
++
++	// Backend recovers: metadata and the pending op point back at the real
++	// object and reconciliation completes the delete.
++	_, err = s.conn.Exec(`UPDATE volumes SET file_path = $2 WHERE file_id = $1`, fileID, originalPath)
++	s.Require().NoError(err)
++	_, err = s.conn.Exec(`
++		UPDATE volumes_ops
++		SET object = jsonb_set(object, '{path}', to_jsonb($2::text))
++		WHERE file_id = $1 AND op_type = 'delete'
++	`, fileID, originalPath)
++	s.Require().NoError(err)
++
++	cfg, err := admin.Store().Config(context.Background())
++	s.Require().NoError(err)
++	s.Require().NoError(volumes.ReconcileOps(context.Background(), cfg.VolumesConfig))
++
++	rows, err := volumes.Store().SelectFiles(context.Background(), volumes.SelectFilesArgs{
++		EnvID:  env.ID,
++		FileID: []types.ID{fileID},
++	})
++	s.NoError(err)
++	s.Empty(rows)
++}
++
++func TestHandlerVolumesLifecycle(t *testing.T) {
++	suite.Run(t, &HandlerVolumesLifecycleSuite{})
++}
+diff --git a/src/ce/api/app/volumes/volumeshandlers/handler_volumes_post.go b/src/ce/api/app/volumes/volumeshandlers/handler_volumes_post.go
+index 97c24e1..78f2d5e 100644
+--- a/src/ce/api/app/volumes/volumeshandlers/handler_volumes_post.go
++++ b/src/ce/api/app/volumes/volumeshandlers/handler_volumes_post.go
+@@ -9,7 +9,6 @@ import (
+ 	"github.com/stormkit-io/stormkit-io/src/ce/api/app/volumes"
+ 	"github.com/stormkit-io/stormkit-io/src/lib/shttp"
+ 	"github.com/stormkit-io/stormkit-io/src/lib/slog"
+-	"github.com/stormkit-io/stormkit-io/src/lib/utils"
+ )
+ 
+ func HandlerVolumesPost(req *app.RequestContext) *shttp.Response {
+@@ -25,20 +24,16 @@ func HandlerVolumesPost(req *app.RequestContext) *shttp.Response {
+ 	cfg, err := admin.Store().Config(req.Context())
+ 
+ 	if err != nil {
+-		return nil
++		return shttp.Error(err)
+ 	}
+ 
+ 	if cfg.VolumesConfig == nil {
+ 		return volumesNotConfigured()
+ 	}
+ 
+-	files := req.MultipartForm.File["files"]
++	items := []volumes.UploadItem{}
+ 
+-	uploadedFiles := []*volumes.File{}
+-	uploadedFilesKeys := map[string]*volumes.File{}
+-	failedFiles := map[string]string{}
+-
+-	for _, fileHeader := range files {
++	for _, fileHeader := range req.MultipartForm.File["files"] {
+ 		_, params, err := mime.ParseMediaType(fileHeader.Header.Get("Content-Disposition"))
+ 
+ 		if err != nil {
+@@ -49,34 +44,15 @@ func HandlerVolumesPost(req *app.RequestContext) *shttp.Response {
+ 			params = map[string]string{}
+ 		}
+ 
+-		file, err := volumes.Upload(cfg.VolumesConfig, volumes.UploadArgs{
++		items = append(items, volumes.UploadItem{
+ 			AppID:              req.App.ID,
+ 			EnvID:              req.EnvID,
+ 			FileHeader:         volumes.FromFileHeader(fileHeader),
+ 			ContentDisposition: params,
+ 		})
+-
+-		if err != nil {
+-			failedFiles[utils.GetString(params["filename"], fileHeader.Filename)] = err.Error()
+-			continue
+-		}
+-
+-		// Prevents duplicate files
+-		if uploadedFilesKeys[file.Name] != nil {
+-			uploadedFilesKeys[file.Name].Size = file.Size
+-			uploadedFilesKeys[file.Name].CreatedAt = file.CreatedAt
+-			continue
+-		}
+-
+-		uploadedFiles = append(uploadedFiles, file)
+-		uploadedFilesKeys[file.Name] = file
+ 	}
+ 
+-	if len(uploadedFiles) > 0 {
+-		if err := volumes.Store().Insert(req.Context(), uploadedFiles, req.EnvID); err != nil {
+-			return shttp.Error(err)
+-		}
+-	}
++	uploadedFiles, failedFiles := volumes.UploadBatch(req.Context(), cfg.VolumesConfig, items)
+ 
+ 	return &shttp.Response{
+ 		Status: http.StatusOK,
+diff --git a/src/ce/api/public/v1/handler_volumes_post.go b/src/ce/api/public/v1/handler_volumes_post.go
+index 625b15e..0c680b3 100644
+--- a/src/ce/api/public/v1/handler_volumes_post.go
++++ b/src/ce/api/public/v1/handler_volumes_post.go
+@@ -1,7 +1,6 @@
+ package publicapiv1
+ 
+ import (
+-	"errors"
+ 	"mime"
+ 	"net/http"
+ 
+@@ -9,7 +8,6 @@ import (
+ 	"github.com/stormkit-io/stormkit-io/src/ce/api/app/volumes"
+ 	"github.com/stormkit-io/stormkit-io/src/lib/shttp"
+ 	"github.com/stormkit-io/stormkit-io/src/lib/slog"
+-	"github.com/stormkit-io/stormkit-io/src/lib/utils"
+ )
+ 
+ func handlerVolumesPost(req *RequestContext) *shttp.Response {
+@@ -48,9 +46,7 @@ func handlerVolumesPost(req *RequestContext) *shttp.Response {
+ 		}
+ 	}
+ 
+-	uploadedFiles := []*volumes.File{}
+-	uploadedFilesKeys := map[string]*volumes.File{}
+-	failedFiles := map[string]string{}
++	items := []volumes.UploadItem{}
+ 
+ 	for _, fileHeader := range files {
+ 		_, params, err := mime.ParseMediaType(fileHeader.Header.Get("Content-Disposition"))
+@@ -63,42 +59,15 @@ func handlerVolumesPost(req *RequestContext) *shttp.Response {
+ 			params = map[string]string{}
+ 		}
+ 
+-		// Sanitization is handled inside the Upload method.
+-		fileName := utils.GetString(params["filename"], fileHeader.Filename)
+-
+-		file, err := volumes.Upload(cfg.VolumesConfig, volumes.UploadArgs{
++		items = append(items, volumes.UploadItem{
+ 			AppID:              req.App.ID,
+ 			EnvID:              req.Env.ID,
+ 			FileHeader:         volumes.FromFileHeader(fileHeader),
+ 			ContentDisposition: params,
+ 		})
+-
+-		if err != nil {
+-			failedFiles[fileName] = err.Error()
+-			continue
+-		}
+-
+-		if file == nil {
+-			slog.Errorf("volumes.Upload returned nil file without error for app %s env %s", req.App.ID, req.Env.ID)
+-			return shttp.Error(errors.New("file storage is misconfigured: upload handler returned no file"))
+-		}
+-
+-		// Deduplicate: keep the last version of a file uploaded in the same request.
+-		if uploadedFilesKeys[file.Name] != nil {
+-			uploadedFilesKeys[file.Name].Size = file.Size
+-			uploadedFilesKeys[file.Name].CreatedAt = file.CreatedAt
+-			continue
+-		}
+-
+-		uploadedFiles = append(uploadedFiles, file)
+-		uploadedFilesKeys[file.Name] = file
+ 	}
+ 
+-	if len(uploadedFiles) > 0 {
+-		if err := volumes.Store().Insert(req.Context(), uploadedFiles, req.Env.ID); err != nil {
+-			return shttp.Error(err)
+-		}
+-	}
++	uploadedFiles, failedFiles := volumes.UploadBatch(req.Context(), cfg.VolumesConfig, items)
+ 
+ 	return &shttp.Response{
+ 		Status: http.StatusOK,
+diff --git a/src/ce/workerserver/job_environments.go b/src/ce/workerserver/job_environments.go
+index 89f8789..ffb2475 100644
+--- a/src/ce/workerserver/job_environments.go
++++ b/src/ce/workerserver/job_environments.go
+@@ -178,7 +178,8 @@ type purgeEnvVolumesParams struct {
+ // purgeEnvVolumes removes every volume file of a single environment, one page at
+ // a time. Rows are only deleted from the database once their bytes are gone, so
+ // a failing physical delete surfaces as an error and the surviving rows retry on
+-// the next run rather than looping forever.
++// the next run rather than looping forever. Staged objects and in-flight
++// operation rows are purged afterwards.
+ func purgeEnvVolumes(ctx context.Context, p purgeEnvVolumesParams) error {
+ 	const batchSize = 100
+ 
+@@ -192,7 +193,7 @@ func purgeEnvVolumes(ctx context.Context, p purgeEnvVolumesParams) error {
+ 		}
+ 
+ 		if len(files) == 0 {
+-			return nil
++			break
+ 		}
+ 
+ 		removed, removeErr := volumes.RemoveFiles(p.config, files)
+@@ -208,7 +209,12 @@ func purgeEnvVolumes(ctx context.Context, p purgeEnvVolumesParams) error {
+ 		}
+ 
+ 		if len(files) < batchSize {
+-			return nil
++			break
+ 		}
+ 	}
++
++	// With every published row gone, staged and displaced objects tracked by
++	// lifecycle operations are unreferenced and can be removed together with
++	// their op rows.
++	return volumes.PurgeEnvOps(ctx, p.config, p.envID)
+ }
+diff --git a/src/ce/workerserver/job_volumes_reconcile.go b/src/ce/workerserver/job_volumes_reconcile.go
+new file mode 100644
+index 0000000..a5d1acb
+--- /dev/null
++++ b/src/ce/workerserver/job_volumes_reconcile.go
+@@ -0,0 +1,27 @@
++package jobs
++
++import (
++	"context"
++
++	"github.com/stormkit-io/stormkit-io/src/ce/api/admin"
++	"github.com/stormkit-io/stormkit-io/src/ce/api/app/volumes"
++)
++
++// ReconcileVolumeOps finishes volume file operations interrupted by a
++// crashed or failed request: aborted uploads have their staged objects
++// reaped, committed replacements have their displaced objects removed and
++// failed deletes are retried. Runs on the elected master so it is safe with
++// live uploads and deletes.
++func ReconcileVolumeOps(ctx context.Context) error {
++	cfg, err := admin.Store().Config(ctx)
++
++	if err != nil {
++		return err
++	}
++
++	if cfg.VolumesConfig == nil {
++		return nil
++	}
++
++	return volumes.ReconcileOps(ctx, cfg.VolumesConfig)
++}
+diff --git a/src/ce/workerserver/job_volumes_test.go b/src/ce/workerserver/job_volumes_test.go
+index ed2528f..eb81854 100644
+--- a/src/ce/workerserver/job_volumes_test.go
++++ b/src/ce/workerserver/job_volumes_test.go
+@@ -2,7 +2,9 @@ package jobs
+ 
+ import (
+ 	"context"
++	"fmt"
+ 	"os"
++	"path/filepath"
+ 	"testing"
+ 	"time"
+ 
+@@ -72,6 +74,41 @@ func (s *JobVolumesSuite) countVolumes(envID types.ID) int {
+ 	return count
+ }
+ 
++func (s *JobVolumesSuite) countOps(envID types.ID) int {
++	var count int
++
++	s.NoError(s.conn.
++		QueryRow("SELECT COUNT(*) FROM volumes_ops WHERE env_id = $1", envID).
++		Scan(&count),
++	)
++
++	return count
++}
++
++// writeOp writes a physical object and a matching lifecycle op row for the
++// environment. It returns the object's physical path.
++func (s *JobVolumesSuite) writeOp(envID types.ID, status, name, content string) string {
++	dir := filepath.Join(s.tmpdir, fmt.Sprintf("a0e%s", envID), "objects", "tok-"+name)
++	s.NoError(os.MkdirAll(dir, 0775))
++
++	objectPath := filepath.Join(dir, name)
++	s.NoError(os.WriteFile(objectPath, []byte(content), 0664))
++
++	_, err := s.conn.Exec(`
++		INSERT INTO volumes_ops (
++			env_id, op_type, status, file_name, file_size,
++			mount_type, object, created_at
++		)
++		VALUES ($1, 'upload', $2, $3, $4, $5, $6, now())
++	`,
++		envID, status, name, len(content), volumes.FileSys,
++		fmt.Sprintf(`{"path": "%s", "name": "%s"}`, dir, name),
++	)
++	s.NoError(err)
++
++	return objectPath
++}
++
+ func (s *JobVolumesSuite) Test_RemoveStaleVolumes() {
+ 	app := s.MockApp(nil)
+ 
+@@ -84,13 +121,72 @@ func (s *JobVolumesSuite) Test_RemoveStaleVolumes() {
+ 	staleFile := s.writeFile(deletedEnv.ID, "stale.txt")
+ 	liveFile := s.writeFile(liveEnv.ID, "live.txt")
+ 
++	// Staged object left behind by an interrupted upload of the deleted env.
++	staleOpObject := s.writeOp(deletedEnv.ID, "pending", "staged.txt", "bytes")
++	// Ops belonging to a live env must be left untouched.
++	liveOpObject := s.writeOp(liveEnv.ID, "committed", "committed.txt", "bytes")
++
+ 	s.NoError(removeStaleVolumes(context.Background(), NewStore()))
+ 
+ 	s.Equal(0, s.countVolumes(deletedEnv.ID), "volume rows for the deleted env should be removed")
+ 	s.NoFileExists(staleFile.FullPath(), "physical file for the deleted env should be removed")
++	s.Equal(0, s.countOps(deletedEnv.ID), "ops rows for the deleted env should be removed")
++	s.NoFileExists(staleOpObject, "staged object for the deleted env should be removed")
+ 
+ 	s.Equal(1, s.countVolumes(liveEnv.ID), "volume rows for the live env must be preserved")
+ 	s.FileExists(liveFile.FullPath(), "physical file for the live env must be preserved")
++	s.Equal(1, s.countOps(liveEnv.ID), "ops rows for the live env must be preserved")
++	s.FileExists(liveOpObject, "physical object for the live env must be preserved")
++}
++
++// Test_RemoveStaleVolumes_OpsOnlyEnv purges a deleted environment that only
++// has in-flight op rows left (its volumes rows were deleted earlier).
++func (s *JobVolumesSuite) Test_RemoveStaleVolumes_OpsOnlyEnv() {
++	app := s.MockApp(nil)
++
++	deletedEnv := s.MockEnv(app, map[string]any{
++		"DeletedAt": utils.Unix{Time: time.Now(), Valid: true},
++	})
++
++	staleOpObject := s.writeOp(deletedEnv.ID, "failed", "staged.txt", "bytes")
++
++	s.NoError(removeStaleVolumes(context.Background(), NewStore()))
++
++	s.Equal(0, s.countOps(deletedEnv.ID))
++	s.NoFileExists(staleOpObject)
++}
++
++// Test_ReconcileVolumeOps aborts an interrupted upload (old pending op with an
++// orphan staged object) through the scheduled job entry point.
++func (s *JobVolumesSuite) Test_ReconcileVolumeOps() {
++	app := s.MockApp(nil)
++	env := s.MockEnv(app)
++	liveFile := s.writeFile(env.ID, "live.txt")
++
++	orphanDir := filepath.Join(s.tmpdir, fmt.Sprintf("a0e%s", env.ID), "objects", "orphan")
++	s.NoError(os.MkdirAll(orphanDir, 0775))
++	orphanPath := filepath.Join(orphanDir, "orphan.txt")
++	s.NoError(os.WriteFile(orphanPath, []byte("orphan"), 0664))
++
++	_, err := s.conn.Exec(`
++		INSERT INTO volumes_ops (
++			env_id, op_type, status, file_name, file_size,
++			mount_type, object, created_at
++		)
++		VALUES ($1, 'upload', 'pending', 'orphan.txt', 6, $2, $3, $4)
++	`,
++		env.ID, volumes.FileSys,
++		fmt.Sprintf(`{"path": "%s", "name": "orphan.txt"}`, orphanDir),
++		time.Now().Add(-time.Hour),
++	)
++	s.NoError(err)
++
++	s.NoError(ReconcileVolumeOps(context.Background()))
++
++	s.NoFileExists(orphanPath, "orphan staged object reaped")
++	s.Equal(0, s.countOps(env.ID))
++	s.FileExists(liveFile.FullPath(), "live object untouched")
++	s.Equal(1, s.countVolumes(env.ID))
+ }
+ 
+ func (s *JobVolumesSuite) Test_RemoveStaleVolumes_NoVolumesConfig() {
+diff --git a/src/ce/workerserver/worker_scheduler.go b/src/ce/workerserver/worker_scheduler.go
+index 90ade60..465a18e 100644
+--- a/src/ce/workerserver/worker_scheduler.go
++++ b/src/ce/workerserver/worker_scheduler.go
+@@ -93,6 +93,7 @@ func (s *Scheduler) RegisterMasterTasks(ctx context.Context) {
+ 		{Handler: CleanupDeletedTeams, Def: dj(EVERY_HOUR), Opt: immediate},
+ 		{Handler: PingDomains, Def: dj(EVERY_MINUTE), Opt: immediate},
+ 		{Handler: TimedOutDeployments, Def: dj(EVERY_MINUTE), Opt: immediate},
++		{Handler: ReconcileVolumeOps, Def: dj(EVERY_MINUTE), Opt: immediate},
+ 	}
+ 
+ 	s.masterTasks = s.registerTasks(ctx, tasks)
+diff --git a/src/ce/workerserver/ws_statements.go b/src/ce/workerserver/ws_statements.go
+index 323dfe7..4686619 100644
+--- a/src/ce/workerserver/ws_statements.go
++++ b/src/ce/workerserver/ws_statements.go
+@@ -271,14 +271,18 @@ var stmt = &statement{
+ 	`,
+ 
+ 	selectStaleVolumeEnvs: `
+-		SELECT DISTINCT
+-			v.env_id
+-		FROM
+-			volumes v
+-		JOIN
+-			apps_build_conf e ON e.env_id = v.env_id
+-		WHERE
+-			e.deleted_at IS NOT NULL
++		SELECT DISTINCT env_id
++		FROM (
++			SELECT v.env_id
++			FROM volumes v
++			JOIN apps_build_conf e ON e.env_id = v.env_id
++			WHERE e.deleted_at IS NOT NULL
++			UNION
++			SELECT o.env_id
++			FROM volumes_ops o
++			JOIN apps_build_conf e ON e.env_id = o.env_id
++			WHERE e.deleted_at IS NOT NULL
++		) AS stale_volume_envs
+ 		LIMIT 50;
+ 	`,
+ 
+diff --git a/src/migrations/0029_2026-10-08.up.sql b/src/migrations/0029_2026-10-08.up.sql
+new file mode 100644
+index 0000000..4fe6636
+--- /dev/null
++++ b/src/migrations/0029_2026-10-08.up.sql
+@@ -0,0 +1,40 @@
++-- Volume file lifecycle operations.
++--
++-- Uploads (including same-name replacements) and deletes cross two systems
++-- that cannot share a transaction: the object backend (filesystem/S3) and the
++-- volumes table. Writing the object first and upserting the row afterwards
++-- leaves a window in which list/download/public-file/size disagree about the
++-- current version, a failed commit orphans the new object, and a crash leaves
++-- no record of what was in flight.
++--
++-- Every upload or delete therefore registers its operation here before
++-- touching the backend. The row carries the exact object locator the backend
++-- wrote (or is about to delete), so that after a restart a reconciliation job
++-- can reach a deterministic outcome: finish the pending object removal, or
++-- abort the interrupted upload. An object is only ever deleted once it is
++-- known to be unreferenced by a live volumes row and by another pending
++-- operation, which is what keeps a still-published object safe.
++CREATE TABLE IF NOT EXISTS volumes_ops (
++    op_id       bigserial PRIMARY KEY,
++    env_id      bigint NOT NULL REFERENCES apps_build_conf(env_id) ON DELETE CASCADE,
++    op_type     text NOT NULL CHECK (op_type IN ('upload', 'delete')),
++    status      text NOT NULL CHECK (status IN ('pending', 'committed', 'failed')),
++    file_id     bigint,
++    file_name   text,
++    file_size   bigint NOT NULL DEFAULT 0,
++    mount_type  text NOT NULL,
++    -- Object locator, shaped like a volumes row's (file_path, file_name) pair
++    -- so the exact same backend code can download or remove it:
++    --   {"path": "<absolute dir or bucket/key-dir>", "name": "<logical name>"}
++    object      jsonb NOT NULL,
++    -- Set when a committed replacement displaced an older object. The object
++    -- is removed after commit (and retried by reconciliation); until then the
++    -- old bytes remain recoverable.
++    replaced    jsonb,
++    error       text,
++    created_at  timestamp without time zone NOT NULL DEFAULT (now() AT TIME ZONE 'UTC'::text),
++    updated_at  timestamp without time zone
++);
++
++CREATE INDEX IF NOT EXISTS idx_volumes_ops_status ON volumes_ops (status);
++CREATE INDEX IF NOT EXISTS idx_volumes_ops_env_id ON volumes_ops (env_id);

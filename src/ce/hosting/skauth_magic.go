@@ -1,0 +1,358 @@
+package hosting
+
+import (
+	"fmt"
+	"html"
+	"strings"
+	"time"
+
+	jwt "github.com/golang-jwt/jwt/v5"
+	"github.com/stormkit-io/stormkit-io/src/ce/api/app/buildconf"
+	"github.com/stormkit-io/stormkit-io/src/ce/api/app/skauth"
+	"github.com/stormkit-io/stormkit-io/src/ce/api/user"
+	"github.com/stormkit-io/stormkit-io/src/lib/shttp"
+	"github.com/stormkit-io/stormkit-io/src/lib/slog"
+	"github.com/stormkit-io/stormkit-io/src/lib/utils"
+)
+
+func (m *skAuthMiddleware) magicLinkRequest() *shttp.Response {
+	req := m.req.RequestContext
+
+	body := &struct {
+		Email               string `json:"email"`
+		Redirect            string `json:"redirect"`
+		CodeChallenge       string `json:"code_challenge"`
+		CodeChallengeMethod string `json:"code_challenge_method"`
+	}{}
+
+	_ = req.Post(body)
+
+	envID := m.req.Host.Config.EnvID
+	email := normalizeEmail(utils.GetString(body.Email, req.Query().Get("email")))
+
+	if envID == 0 {
+		return shttp.NotFound()
+	}
+
+	if !utils.IsValidEmail(email) {
+		return shttp.BadRequest(map[string]any{"errors": []string{"email is invalid"}})
+	}
+
+	env, err := buildconf.NewStore().EnvironmentByID(req.Context(), envID)
+
+	if err != nil {
+		return shttp.Error(err, fmt.Sprintf("failed to get environment by ID %d", envID))
+	}
+
+	if env == nil || env.AuthConf == nil || !env.AuthConf.Status || env.SchemaConf == nil {
+		return shttp.NotFound()
+	}
+
+	// redirect is where the user is sent back to after clicking the email link.
+	// Browsers may omit it (we fall back to the Origin header); native clients
+	// pass it explicitly (e.g. a deep link). It is honoured only when it is on
+	// the configured allow-list; otherwise the flow stays single-host.
+	redirect := utils.GetString(body.Redirect, req.Query().Get("redirect"))
+
+	if redirect == "" {
+		redirect = m.req.Header.Get("Origin")
+	}
+
+	redirect = strings.TrimRight(redirect, "/")
+
+	// When an allow-list is configured, a supplied redirect must be on it.
+	if len(env.AuthConf.AllowedOrigins) > 0 && redirect != "" && !env.AuthConf.IsAllowedOrigin(redirect) {
+		return shttp.Forbidden()
+	}
+
+	if !env.AuthConf.IsAllowedOrigin(redirect) {
+		redirect = ""
+	}
+
+	// A custom-scheme redirect delivers the session through a PKCE-bound code, so
+	// the challenge has to be captured now and travel with the link — the user's
+	// inbox sits between this request and the redemption.
+	challenge := utils.GetString(body.CodeChallenge, req.Query().Get("code_challenge"))
+
+	if resp := validateNativeChallenge(
+		redirect,
+		challenge,
+		utils.GetString(body.CodeChallengeMethod, req.Query().Get("code_challenge_method")),
+	); resp != nil {
+		return resp
+	}
+
+	prv, err := skauth.NewStore().Provider(req.Context(), envID, skauth.ProviderMagicLink)
+
+	if err != nil {
+		return shttp.Error(err, fmt.Sprintf("failed to get provider: %s", err.Error()))
+	}
+
+	if prv == nil || !prv.Status {
+		return shttp.NotFound()
+	}
+
+	token, err := generateMagicLinkToken(generateMagicLinkTokenParams{
+		Env:            env,
+		RedirectOrigin: redirect,
+		CodeChallenge:  challenge,
+	})
+
+	if err != nil {
+		return shttp.Error(err, fmt.Sprintf("failed to generate magic link token: %s", err.Error()))
+	}
+
+	store, err := env.SchemaConf.Store(buildconf.SchemaAccessTypeAppUser)
+
+	if err != nil {
+		return shttp.Error(err, fmt.Sprintf("failed to get schema store: %s", err.Error()))
+	}
+
+	if _, err := store.UpsertMagicLinkUser(req.Context(), email, token); err != nil {
+		return shttp.Error(err, fmt.Sprintf("failed to upsert magic link user: %s", err.Error()))
+	}
+
+	if err := sendMagicLinkEmail(req, env, prv, email, token); err != nil {
+		return shttp.Error(err, fmt.Sprintf("failed to send magic link email: %s", err.Error()))
+	}
+
+	return shttp.OK()
+}
+
+func (m *skAuthMiddleware) magicLinkVerify() *shttp.Response {
+	req := m.req.RequestContext
+
+	token := req.Query().Get("token")
+
+	if token == "" {
+		return shttp.BadRequest(map[string]any{"errors": []string{"token is required"}})
+	}
+
+	envID := m.req.Host.Config.EnvID
+
+	if envID == 0 {
+		return shttp.NotFound()
+	}
+
+	env, err := buildconf.NewStore().EnvironmentByID(req.Context(), envID)
+
+	if err != nil {
+		return shttp.Error(err, fmt.Sprintf("failed to get environment by ID %d", envID))
+	}
+
+	if env == nil || env.AuthConf == nil || !env.AuthConf.Status || env.SchemaConf == nil {
+		return shttp.NotFound()
+	}
+
+	prv, err := skauth.NewStore().Provider(req.Context(), envID, skauth.ProviderMagicLink)
+
+	if err != nil {
+		return shttp.Error(err, fmt.Sprintf("failed to get provider: %s", err.Error()))
+	}
+
+	if prv == nil || !prv.Status {
+		return shttp.NotFound()
+	}
+
+	claims := user.ParseJWT(&user.ParseJWTArgs{Bearer: token, Secret: env.AuthConf.Secret, Purposes: []user.Purpose{user.PurposeSkAuthMagicLink}})
+
+	if claims == nil {
+		// Expiry is the ordinary way a magic link fails, and the user is often in a
+		// native app's system browser with nowhere else to land. The origin is
+		// recovered from the unvalidated claims purely to aim the error redirect —
+		// see unverifiedRedirectOrigin for why that is safe.
+		return shttp.BadRequest(map[string]any{
+			"errors":   []string{"invalid or expired magic link token"},
+			"redirect": unverifiedRedirectOrigin(token, env.AuthConf),
+		})
+	}
+
+	redirectOrigin, _ := claims["rdr"].(string)
+
+	// Re-validate at click time in case the allow-list changed between
+	// request and verify; don't trust a stale claim.
+	if redirectOrigin != "" && !env.AuthConf.IsAllowedOrigin(redirectOrigin) {
+		redirectOrigin = ""
+	}
+
+	store, err := env.SchemaConf.Store(buildconf.SchemaAccessTypeAppUser)
+
+	if err != nil {
+		return shttp.Error(err, fmt.Sprintf("failed to get schema store: %s", err.Error()))
+	}
+
+	userID, err := store.ConsumeMagicLinkToken(req.Context(), token)
+
+	if err != nil {
+		return shttp.Error(err, fmt.Sprintf("failed to consume magic link token: %s", err.Error()))
+	}
+
+	if userID == 0 {
+		// We parsed the token, so we know the initiating origin — pass it through
+		// so the error redirect lands on the right app rather than this host.
+		return shttp.BadRequest(map[string]any{
+			"errors":   []string{"invalid or expired magic link token"},
+			"redirect": redirectOrigin,
+		})
+	}
+
+	authUser, err := store.AuthUser(req.Context(), userID)
+
+	if err != nil {
+		return shttp.Error(err, fmt.Sprintf("failed to fetch user: %s", err.Error()))
+	}
+
+	if authUser == nil {
+		return shttp.Error(fmt.Errorf("user %d not found after consuming magic link", userID), "internal error")
+	}
+
+	if err := store.UpdateLastLogin(req.Context(), userID); err != nil {
+		slog.Errorf("magic link verify: failed to update last login: %s", err.Error())
+	}
+
+	sessionToken, err := user.JWT(user.JWTParams{Purpose: user.PurposeSkAuthSession, Claims: jwt.MapClaims{
+		"uid": authUser.UUID,
+		"eml": utils.EncryptToString(authUser.Email, emlKey(env.AuthConf.Secret)),
+		"eid": fmt.Sprintf("%d", envID),
+		"prv": skauth.ProviderMagicLink,
+	}, Secret: env.AuthConf.Secret})
+
+	if err != nil {
+		return shttp.Error(err, fmt.Sprintf("failed to generate session token: %s", err.Error()))
+	}
+
+	data := map[string]any{"token": sessionToken, "email": authUser.Email, "userId": authUser.UUID}
+
+	if redirectOrigin != "" {
+		data["redirect"] = redirectOrigin
+
+		if challenge, _ := claims["cha"].(string); challenge != "" {
+			data["codeChallenge"] = challenge
+		}
+	}
+
+	return &shttp.Response{Data: data}
+}
+
+// unverifiedRedirectOrigin recovers the `rdr` claim from a magic-link token that
+// failed validation, so an expired or malformed link can still bounce the user
+// back to the app that started the sign-in instead of stranding them on this
+// host — which, in a native app's system browser, means a sheet that never
+// closes.
+//
+// Reading unvalidated claims is safe here because the signature is not what
+// authorizes the target: the recovered origin is re-checked against the
+// environment's allow-list, so a forged claim can only ever name an origin the
+// operator already registered. It is used solely to aim an error redirect; no
+// session is delivered on this path.
+func unverifiedRedirectOrigin(token string, conf *buildconf.SKAuthConf) string {
+	claims := jwt.MapClaims{}
+
+	if _, _, err := jwt.NewParser().ParseUnverified(token, claims); err != nil {
+		return ""
+	}
+
+	origin, _ := claims["rdr"].(string)
+
+	if origin == "" || !conf.IsAllowedOrigin(origin) {
+		return ""
+	}
+
+	return origin
+}
+
+type generateMagicLinkTokenParams struct {
+	Env            *buildconf.Env
+	RedirectOrigin string
+	// CodeChallenge is the PKCE S256 challenge for a custom-scheme redirect. It
+	// rides the link so the delivery step can bind the session code to it.
+	CodeChallenge string
+}
+
+func generateMagicLinkToken(p generateMagicLinkTokenParams) (string, error) {
+	jti, err := utils.SecureRandomToken(16)
+
+	if err != nil {
+		return "", err
+	}
+
+	claims := jwt.MapClaims{
+		"exp": time.Now().Add(15 * time.Minute).Unix(),
+		"prv": skauth.ProviderMagicLink,
+		"jti": jti,
+	}
+
+	if p.RedirectOrigin != "" {
+		claims["rdr"] = p.RedirectOrigin
+	}
+
+	if p.CodeChallenge != "" {
+		claims["cha"] = p.CodeChallenge
+	}
+
+	return user.JWT(user.JWTParams{Purpose: user.PurposeSkAuthMagicLink, Claims: claims, Secret: p.Env.AuthConf.Secret})
+}
+
+const defaultMagicLinkSubject = "Your magic link"
+
+// defaultMagicLinkBody is used when the provider has no custom body. Both
+// verbs are filled with HTML-escaped values: the host, then the sign-in URL.
+const defaultMagicLinkBody = `<p>Use the button below to sign in to %s. The link expires in 15 minutes.</p>` +
+	`<p><a href="%s" style="display:inline-block;padding:10px 20px;background:#111827;color:#ffffff;border-radius:6px;text-decoration:none;font-weight:600">Sign in</a></p>` +
+	`<p>If you did not request this email, you can safely ignore it.</p>`
+
+type magicLinkEmail struct {
+	Provider *skauth.Provider
+	Host     string
+	Link     string
+}
+
+// subject returns the configured subject, or the default when none is set.
+// Newlines are stripped so a stored subject cannot inject SMTP headers.
+func (m magicLinkEmail) subject() string {
+	return buildconf.SanitizeHeader(utils.GetString(m.Provider.Data.Subject, defaultMagicLinkSubject))
+}
+
+// body renders the configured template, or the default one. Only the link is
+// escaped: the template itself is HTML authored by the app owner.
+func (m magicLinkEmail) body() string {
+	link := html.EscapeString(m.Link)
+
+	if tpl := m.Provider.Data.Body; tpl != "" {
+		return strings.ReplaceAll(tpl, skauth.MagicLinkPlaceholder, link)
+	}
+
+	return fmt.Sprintf(defaultMagicLinkBody, html.EscapeString(m.Host), link)
+}
+
+func sendMagicLinkEmail(req *shttp.RequestContext, env *buildconf.Env, prv *skauth.Provider, email, token string) error {
+	u := req.URL()
+
+	msg := magicLinkEmail{
+		Provider: prv,
+		Host:     u.Host,
+		Link:     fmt.Sprintf("%s://%s/_stormkit/auth/magic?token=%s", u.Scheme, u.Host, token),
+	}
+
+	params := buildconf.SendEmailParams{
+		To:      email,
+		From:    prv.Data.FromAddress,
+		Subject: msg.subject(),
+		Body:    msg.body(),
+	}
+
+	if err := buildconf.MailerStore().InsertEmail(req.Context(), buildconf.Email{
+		EnvID:   env.ID,
+		To:      email,
+		Subject: params.Subject,
+		Body:    params.Body,
+	}); err != nil {
+		return err
+	}
+
+	if env.MailerConf != nil {
+		return env.MailerConf.Send(params)
+	}
+
+	return nil
+}

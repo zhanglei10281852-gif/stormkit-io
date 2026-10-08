@@ -1,0 +1,13 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`~/layouts/AppLayout/routes.ts > should match routes 1`] = `
+[
+  "/environments",
+  "/environments/default",
+  "/environments/:envId/*",
+  "/settings",
+  "/deployments",
+  "/deployments/:deploymentId",
+  "/feed",
+]
+`;
