@@ -1,0 +1,111 @@
+package apphandlers
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/stormkit-io/stormkit-io/src/ce/api/app/deploy/webhookdelivery"
+	"github.com/stormkit-io/stormkit-io/src/lib/shttp"
+	"github.com/stormkit-io/stormkit-io/src/lib/slog"
+	"gopkg.in/go-playground/webhooks.v5/gitlab"
+)
+
+const VisibilityLevelPublic = 20
+
+func processGitlabPayload(req *shttp.RequestContext) (*TriggerDeployInput, error) {
+	// The per-app secret was verified before this parser runs, so the body is
+	// only read now. Capture it for the delivery inbox and restore it for the
+	// provider parser.
+	body, err := readAndRestoreBody(req)
+
+	if err != nil {
+		return nil, err
+	}
+
+	hook, _ := gitlab.New()
+	payload, err := hook.Parse(
+		req.Request,
+		gitlab.PushEvents,
+		gitlab.MergeRequestEvents,
+		gitlab.CommentEvents,
+	)
+
+	// Events the hook was not registered for are not an error.
+	if errors.Is(err, gitlab.ErrEventNotFound) {
+		return nil, nil
+	}
+
+	if err != nil {
+		event_type := req.Header.Get("X-Gitlab-Event")
+		slog.Infof("Gitlab Request failed for event type %s", event_type)
+		return nil, err
+	}
+
+	input := TriggerDeployInput{
+		Provider:   webhookdelivery.ProviderGitLab,
+		deliveryID: deliveryHeader(req.Header.Get("X-Gitlab-Event-UUID")),
+		payloadRaw: body,
+		payload:    payload,
+	}
+
+	switch event := payload.(type) {
+
+	// Commit event
+	case gitlab.PushEventPayload:
+		input.Branch = strings.Replace(event.Ref, "refs/heads/", "", 1)
+		input.Repo = fmt.Sprintf("gitlab/%s", event.Project.PathWithNamespace)
+		input.CheckoutRepo = input.Repo
+		input.EventType = typeCommit
+
+		// Pushes without commits, such as a force-push to an existing commit,
+		// have nothing new to build.
+		if len(event.Commits) == 0 {
+			return nil, nil
+		}
+
+		input.Message = strings.Split(event.Commits[0].Message, "\n")[0]
+		input.IsFork = false
+		input.ChangesComplete = len(event.Commits) > 0 && int64(len(event.Commits)) == event.TotalCommitsCount
+
+		for _, commit := range event.Commits {
+			input.ChangedFiles = append(input.ChangedFiles, commit.Added...)
+			input.ChangedFiles = append(input.ChangedFiles, commit.Modified...)
+			input.ChangedFiles = append(input.ChangedFiles, commit.Removed...)
+		}
+
+		// Do not build commits that were not in default branch because:
+		// 1. If the commit is made into a pull request - we'll receive the event anyways.
+		// 2. If the commit is made outside of a pull request, we don't have anywhere to report anyways.
+		if !strings.EqualFold(input.Branch, event.Project.DefaultBranch) {
+			return nil, nil
+		}
+
+	// Pull request event
+	// Build the source branch in this case.
+	//
+	// Known issue:
+	// - GitLab sends a second push event when the build is complete and we leave a message on the PR.
+	//   But we overcome this by checking the commits that were built previously and we don't rebuild.
+	case gitlab.MergeRequestEventPayload:
+		// This is a no-op, we only want to build when the pull request is opened.
+		// When there is a new commit on the PR, we still receive `opened` state anyways.
+		if event.ObjectAttributes.State != "opened" {
+			return nil, nil
+		}
+
+		input.Repo = fmt.Sprintf("gitlab/%s", event.Project.PathWithNamespace)
+		input.CheckoutRepo = fmt.Sprintf("gitlab/%s", event.ObjectAttributes.Source.PathWithNamespace)
+		input.IsFork = !strings.EqualFold(input.CheckoutRepo, input.Repo)
+		input.Message = strings.Split(event.ObjectAttributes.LastCommit.Message, "\n")[0]
+		input.PullRequestNumber = event.ObjectAttributes.IID
+		input.Branch = event.ObjectAttributes.SourceBranch
+		input.CommitSha = event.ObjectAttributes.LastCommit.ID
+		input.EventType = typePullRequest
+
+	default:
+		return nil, nil
+	}
+
+	return &input, nil
+}

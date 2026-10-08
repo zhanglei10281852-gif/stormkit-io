@@ -1,0 +1,3630 @@
+diff --git a/.trae/specs/webhook-delivery-idempotency/review.md b/.trae/specs/webhook-delivery-idempotency/review.md
+new file mode 100644
+index 0000000..1ec094b
+--- /dev/null
++++ b/.trae/specs/webhook-delivery-idempotency/review.md
+@@ -0,0 +1,54 @@
++# Independent Review Report - Webhook 投递认领与部署幂等性
++
++- **Reviewer**: 独立子代理（fresh context，只读）
++- **R1 Date**: 2026-10-08
++- **R2 Date**: 2026-10-08（修复后复审）
++- **Scope**: spec.md/tasks.md、0029 迁移、webhookdelivery 新包、deploy/deployservice 改造、apphandlers 编排、workerserver job 及全部新测试
++- **Run Context**: Linux golang 1.26 容器（专用 Postgres stormkit-pg-01 + Redis，skit-net/host），`-tags=imageopt,alibaba`
++
++## Checkpoint Results（R2 最终结论）
++
++| Checkpoint | 覆盖 AC | R1 | R2 | Evidence |
++|---|---|---|---|---|
++| CP-R1 | AC-1 | PASS | PASS | Test_Delivery_DuplicateRequestDeploysOnce（三家各一例）：200/200、Deploy=1、succeeded 1 行；ON CONFLICT + succeeded 短路 |
++| CP-R2 | AC-2 | PASS | PASS | Test_Delivery_ConcurrentRequestAccepted：预置新鲜 processing → 202、零部署；ClaimResult created 标志区分新插/既有 |
++| CP-R3 | AC-3 | PARTIAL | PASS | 增补显式 23505 断言（Test_ClaimResult_NewAndExisting）；fan-out 测试 + DueResults 回读 |
++| CP-R4 | AC-4 | PASS | PASS | Test_Delivery_MultipleEnvironmentsFanOut：Deploy=2、env_id 互异、2 行 succeeded |
++| CP-R5 | AC-5 | FAIL（F-1） | PASS | HTTP/后台统一 resumeClaimedResult：deployment 已存在仅 Dispatch；Test_Delivery_RedeliveryWithDeploymentDispatchesOnly + Test_RecoverStaleClaim_DispatchesExistingDeployment；ErrTaskIDConflict 归一 |
++| CP-R6 | AC-6 | PASS | PASS | Test_RecoverStaleClaim_CreatesMissingDeployment：重放事件、DeliveryResultID 绑定、Deploy=1 |
++| CP-R7 | AC-7 | PASS | PASS | Test_Delivery_DeployFailureThenRedelivery（插入前失败）+ Dispatch-only 用例（入队失败窗口）；503→retryable→200 |
++| CP-R8 | AC-8 | FAIL（F-2/F-3） | PASS | DeployCandidates 失败恢复 500；deploymentForClaim 错误上抛；终态写失败回落 503 |
++| CP-R9 | AC-9 | PARTIAL | PASS | 新增 Test_RecoverDueRetryable / Test_RecoverSkipsExhaustedRetry / Test_Recover_BadClaimDoesNotStopBatch；leader 每分钟注册 |
++| CP-R10 | AC-10 | PASS | PASS | legacyTriggerDeploy 逐行保留；Test_DoNotRebuildSameCommits 等零修改通过；无身份头零认领写入 |
++| CP-R11 | AC-11 | PASS | PASS | 拒签不读 body、非匹配/tag/fork/sample 短路不写表，三家既有套件全绿 |
++| CP-R12 | AC-12 | PARTIAL | PASS | 迁移幂等；新列 nullable；显式列 INSERT 不受影响；软删除谓词测试；整树回归与基线失败集一致 |
++| CP-R13 | AC-13 | PASS | PASS | 内部测试 + store provider 维度测试 + 三家用例；trim/空串降级 |
++| CP-R14 | AC-14 | 4/5 | 4/5 | 分层/命名/注释/shttp 约定/测试组织符合 AGENTS.md |
++
++## Findings 处置
++
++| ID | Severity | 问题 | 处置 |
++|---|---|---|---|
++| F-1 | major | HTTP reclaim 路径无条件 Deploy，deployment 已存在时撞唯一键返 503 | 已修：新增 resumeClaimedResult，HTTP/后台共用「有 deployment 仅 Dispatch」；补 HTTP 用例 |
++| F-2 | major | DeployCandidates 错误返 503（FR-9 要求 500） | 已修：恢复 shttp.Error=500 |
++| F-3 | minor | deploymentForClaim 吞 DB 错误 | 已修：返回 (depl, error) 并上抛 |
++| F-4 | minor | job 测试证据缺口 | 已补：到期 retryable、attempts=10 跳过、坏行不中断整批 |
++| F-5 | suggestion | SKIP LOCKED 在自动提交下不持锁 | 已加注释说明真正门闩是 ReclaimResult 条件 UPDATE |
++| F-6 | suggestion | 部分唯一索引未排除软删除 deployment | 已修：谓词加 deleted_at IS NULL；两个 dispatch 查询同步过滤；补 Test_InsertDeployment_SoftDeletedFreesClaim |
++| F-8 | suggestion | MarkSucceeded 无状态守卫 | 已修：AND status='processing'（reclaim 后 processing 的状态机由测试固化） |
++| F-7 | suggestion | 确定性失败（额度/体积）也重试 10 次 | 接受：FR-6 字面行为，运营可观测（attempts/last_error） |
++| F-9 | suggestion | mock 成功不插 deployment，HTTP 层未断言 deployment_id | 接受：deploy 包唯一索引/绑定测试兜底；dispatch-only 用例已用真实 deployment |
++
++## R2 非阻塞观察（记录，不影响合入）
++1. MarkSucceeded 守卫可进一步强化为 owner-token（claimed_at 纪元比对）；当前残余竞态需 HTTP 处理卡超 2 分钟租约且秒级流程下不可达，且唯一索引保证无第二条外部部署。
++2. dispatch-only 分支不再发 GitHub pending status（装饰性，首投通常已发）。
++3. app 在认领窗口内被删除时 HTTP 计成功（200）而行状态 retryable；该环境已无部署意义，attempts 上限后停车。
++
++## 回归验证（实现者执行，审查者静态核对）
++- 通过包：apphandlers、deploy、deploy/webhookdelivery、deployservice、workerserver 及整树 ./src/ce/api/app/...（`-p=1`，host 网络，2026-10-08）。
++- 与干净基线（git worktree @976537e）对照，唯一复现的既有失败为 TestHandlerDeployStart/Test_Zip、Test_Zip_AutoPublish（依赖本地 runner 二进制）与 public/v1 全包 MCP 套件挂起；隔离运行均通过，与本次改动无关。
++- `go vet -tags=imageopt,alibaba` 零告警；`gofmt -l` 零差异；`go build -tags=alibaba ./...` 通过。
++
++## Review History
++- **R1: FAIL** → 2 major + 4 minor/suggestion 必修/建议项；实现者修复并补测试。
++- **R2: PASS** → F-1/F-2 及 F-3/F-4/F-5/F-6/F-8 全部以代码+测试证据闭合，无阻塞性新缺陷。
+diff --git a/.trae/specs/webhook-delivery-idempotency/spec.md b/.trae/specs/webhook-delivery-idempotency/spec.md
+new file mode 100644
+index 0000000..2bfc6d6
+--- /dev/null
++++ b/.trae/specs/webhook-delivery-idempotency/spec.md
+@@ -0,0 +1,200 @@
++# Webhook 投递认领与部署幂等性 - 产品需求文档
++
++## Overview
++- **Summary**: 为自动部署 Webhook 入口（GitHub / GitLab / Bitbucket → `/app/webhooks/{provider}`）建立基于供应商投递身份（delivery identity）的持久化认领状态，使重复投递、并发请求、进程崩溃、数据库瞬时故障与部署入队失败都只产生一个可重试的部署结果；同一提交匹配多个应用/环境时各自独立留痕；不携带投递身份的旧调用继续走现有提交去重。
++- **Purpose**: 现状 `TriggerDeploy` 仅靠部署前的 `commitHasBeenBuilt`（按 commit_id 去重，且多数 push 事件没有 commit sha）与进程内执行顺序保证幂等：供应商重投同一 delivery、两个请求同时到达会在同一应用环境重复启动部署；进程在执行中途重启会丢失事件；Deploy 阶段失败后重试会插入第二条 deployment 记录并二次入队。需要数据库持久化的认领与结果状态来闭合这些窗口。
++- **Target Users**: 配置了自动部署的 Stormkit 实例运营者与应用开发者（间接受益：GitHub/GitLab/Bitbucket 的投递方需要稳定 HTTP 语义）。
++
++## Goals
++- 带投递身份的事件：重复投递与并发请求对每个匹配的（应用, 环境）只产生一次外部部署（deployment 行 + 构建队列任务）。
++- 认领状态可持久化、可追踪：事件原文、规范化字段、每个环境的处理状态/部署关联/错误/尝试次数落库，进程重启不丢。
++- 领取之后崩溃、数据库暂时失败、部署启动失败均可通过供应商重新投递或后台重试恢复，且恢复不产生第二次外部部署。
++- 供应商在「已处理 / 处理中 / 可安全重试」三种情形下都收到稳定、可预期的 HTTP 响应。
++- 同一提交合法对应多个应用或环境时，每个（应用, 环境）保留独立结果并关联回原始事件，不被错误合并。
++- 不携带投递身份的旧 GitLab / 兼容调用保持现有提交去重行为；签名校验、非匹配事件、部署查询结果不回归。
++
++## Non-Goals
++- 不改动手动部署入口（`handler_deploy_start`）、部署回调、发布（publish）、部署查询接口的行为与响应结构。
++- 不改变供应商 payload 解析规则、白名单事件集合、分支/路径过滤规则本身。
++- 不为认领记录做数据保留/清理任务（不新增清理 job；记录量级与部署量级相当，后续可单独迭代）。
++- 不引入分布式锁服务或新中间件；认领的唯一事实来源是 PostgreSQL，重试调度沿用现有 gocron leader 任务机制。
++- 不改变 GitLab/Bitbucket 每应用 URL 密钥的校验方式与 GitHub 的 HMAC 校验方式。
++
++## Background & Context
++- 入口：[handler_inbound_webhooks.go](file:///f:/swe/098803/project-01/src/ce/api/app/apphandlers/handler_inbound_webhooks.go) 的 `handlerInboundWebhooks → processMessage → TriggerDeploy`；三家解析分别在 `handler_inbound_webhooks_{github,gitlab,bitbucket}.go`。
++- 现有去重：`commitHasBeenBuilt → deploy.Store.IsDeploymentAlreadyBuilt`（SQL：`commit_id = $1 AND ($2 = 0 OR app_id = $2)`），命中返回 `208 Already Reported`；该检查主要对携带 commit sha 的 GitLab MR 事件有效（GitHub/GitLab push 一般不填 CommitSha）。
++- 外部部署副作用由 `deployservice.DefaultDeployer.Deploy` 产生：先 `InsertDeployment` 落 deployment 行，再 `tasks.Enqueue(DeploymentStart, TaskID="deployment-<id>")` 入 asynq 队列。两步之间失败/崩溃会留下「有 deployment 无任务」的窗口；盲目重试会再插一条 deployment。
++- asynq v0.25.1 对相同 TaskID 的在队/在执行任务返回 `asynq.ErrTaskIDConflict`（`client.go:228`），因此同一 deployment 的重复入队可被识别为「已派发」。
++- 投递身份头（已核实官方文档）：
++  - GitHub：`X-GitHub-Delivery`，GUID 在同一 delivery 的所有重投中保持不变（GitHub 官方自动重投指南明确按 GUID 归并）。
++  - GitLab：`X-Gitlab-Event-UUID`，非递归 webhook 的事件唯一 ID；旧版本/兼容客户端不发送。
++  - Bitbucket Cloud：`X-Request-UUID`，标识同一次投递（其自动重试以 `X-Attempt-Number` 递增，Request UUID 不变）。
++- 后台：`src/ce/workerserver` 使用 gocron + leader 选举注册主任务（如 `TimedOutDeployments` 每分钟），EE worker 复用 CE `jobs.Server()`；在其中注册恢复任务即可同时覆盖 CE/EE。
++- 测试：真实 Postgres + 迁移文件驱动（`databasetest.InitTx`，每个用例一个事务），webhook 测试通过 `deployservice.MockDeployer` 避免依赖 Redis；新增迁移文件 `0029_*.up.sql` 会被测试自动应用。
++- 迁移写法：幂等 SQL（`IF NOT EXISTS`/`IF EXISTS`）+ 注释说明；`structure.sql` 是过期快照（缺少 is_priority 等近期列），近期迁移均不维护它。
++- Windows 本机无法直接编译 Linux 专有依赖（nixstore、aliyun CLI），验证以 `GOOS=linux go vet`/`go test -c` 编译检查 + Linux golang 容器内跑真实测试为准。
++
++## Functional Requirements
++
++- **FR-1 投递身份提取**：三家 provider 处理器从请求头提取投递身份（GitHub `X-GitHub-Delivery`、GitLab `X-Gitlab-Event-UUID`、Bitbucket `X-Request-UUID`），并随解析结果携带 provider 名；身份为空时整段逻辑走旧路径。
++- **FR-2 原始事件留存**：对带身份且通过签名校验、解析为可部署事件（非 sample/fork/非匹配事件的短路场景）的请求，将原始 payload 与规范化字段（repo、checkoutRepo、branch、message、eventType、commitSha、PR 号、isFork、changesComplete、changedFiles）以「首次收到为准」 upsert 到事件父表；父表唯一键为 `(provider, provider_delivery_id)`。
++- **FR-3 每环境结果行**：父事件下，每个匹配到的（应用, 环境）对应一行结果，唯一键 `(delivery_id, app_id, env_id)`，记录 status（`processing`/`succeeded`/`retryable`）、deployment 关联、attempts、last_error、claimed_at（租约）、next_retry_at、finished_at 与时间戳。
++- **FR-4 原子认领**：认领通过 `INSERT ... ON CONFLICT DO NOTHING` + 条件 `UPDATE ... RETURNING` 完成；并发的后来者读到新鲜租约下的 `processing` 时不得创建 deployment 或入队。
++- **FR-5 部署与认领绑定**：自动部署创建的 deployment 在插入时携带其结果行 ID；数据库以部分唯一索引保证「一个结果行至多一条 deployment」。Deploy 拆分为「创建 deployment」与「派发到队列」两步，恢复时若 deployment 已存在则只重新派发同一 deployment；asynq TaskID 冲突视为已派发成功。
++- **FR-6 失败标记**：Deploy 创建/派发阶段返回错误时，结果行置为 `retryable`、记录 last_error 与 next_retry_at（指数退避），HTTP 返回可重试状态；已取得的 deployment ID 必须持久化到结果行（含崩溃窗口下经 `deployments.delivery_result_id` 反查）。
++- **FR-7 后台恢复**：leader 专属任务每分钟扫描「租约过期仍 processing」与「next_retry_at 到期且 attempts 未达上限」的结果行，`SKIP LOCKED` 取行后复用与 HTTP 相同的处理逻辑：有 deployment → 仅派发；无 deployment → 用父事件存储字段重建输入并重新选取候选后创建+派发。
++- **FR-8 重新投递恢复**：供应商重新投递（相同身份）在任何状态下都应被接受：succeeded → 不重复部署；retryable/过期 processing → 同步认领并继续；新鲜 processing → 返回处理中响应。重新投递的恢复不受自动重试次数上限约束。
++- **FR-9 响应语义**：
++  - 全部匹配环境已派发或此前已成功：`200 OK`（含本次新建数为 0 但有成功结果的重投）；
++  - 存在被其他在飞请求持有的认领：`202 Accepted`，且本次不产生任何外部部署；
++  - 签名通过但无需部署（非匹配事件、tag、fork、sample、无候选等，与现状一致）：`204 No Content`；
++  - 旧路径命中提交去重：`208 Already Reported`（现状不变）；delivery 路径仍保留跨事件提交守卫，命中时同样 208；
++  - 认领持久化、deployment 创建/派发等可恢复故障：`503 Service Unavailable`；
++  - 应用查询失败：维持 `500`；签名失败：维持 `403`。
++- **FR-10 多环境扇出**：一次 delivery 匹配多个应用/环境时，各自独立认领、独立部署、独立留结果；per-app 密钥（GitLab/Bitbucket）仍限定只部署该 app；默认分支不匹配时 `ShouldPublish=false` 等现有候选处理逻辑不变。
++- **FR-11 旧路径保留**：投递身份缺失时，`TriggerDeploy` 走与今天完全一致的流程（`commitHasBeenBuilt` → 候选循环 → `Deploy`），不写任何认领表，响应码与现状一致。
++- **FR-12 不回归约束**：签名校验顺序（拒签前不读/少读 body）、白名单与非匹配事件 204、部署列表/详情查询、手动部署与优先级重排队等既有能力不因新列/新表回归；新增列必须 nullable，既有 INSERT 使用显式列清单且不受影响。
++- **FR-13 跨事件提交守卫**：delivery 路径在创建认领前保留 `IsDeploymentAlreadyBuilt` 守卫，使 GitLab 因评论等触发的「不同事件 UUID、同一 commit」冗余推送仍被 208 拦截；守卫不区分环境的现状语义保持不变（同一请求内的多环境扇出发生在守卫之后，不受影响）。
++
++## Non-Functional Requirements
++- **NFR-1 持久化与重启安全**：认领状态只存 PostgreSQL；不依赖进程内存与 Redis 即可在重启后判断事件是否已被认领/部署。
++- **NFR-2 并发安全**：同一（delivery, app, env）的并发请求至多一个进入部署创建路径，由数据库唯一约束 + 条件更新保证，不使用进程内锁。
++- **NFR-3 可观测性**：结果行保留 last_error、attempts、claimed_at、next_retry_at、finished_at，可通过 SQL 直接追踪每个 delivery 在每个环境的终态。
++- **NFR-4 测试隔离**：新测试沿用 txdb 事务回滚与 `MockDeployer`，不要求 Redis；MockDeployer 扩展后既有测试无需批量改写。
++- **NFR-5 代码约定**：遵循 AGENTS.md（store/statements/model 分层、handler 命名与同级测试、逻辑块间空行、导出函数注释、Conventional Commits）。
++- **NFR-6 性能**：认领路径每次请求仅增加常数次主键/唯一索引查询；恢复任务单次批量上限（50 行）并使用 `SKIP LOCKED`，避免长事务与重复执行。
++
++## Constraints
++- **Technical**:
++  - PostgreSQL（`pq`、`database.IsDuplicate`、`ON CONFLICT`、部分唯一索引、`FOR UPDATE SKIP LOCKED`）。
++  - 新迁移编号 `0029`，日期 2026-10-08，文件内嵌 `//go:embed *.up.sql` 自动生效。
++  - asynq TaskID 与 `ErrTaskIDConflict` 语义；不新增队列。
++  - Go 1.26；Windows 开发机用交叉编译检查 + Linux 容器执行测试。
++- **Business**: 不改变供应商接入方式与 URL 形态；旧客户端零感知。
++- **Dependencies**: `deploy`、`deployservice`、`app`、`lib/database`、`lib/tasks`、`ce/workerserver` 既有能力。
++
++## Assumptions
++- 供应商身份头缺失即视为「旧/兼容调用」，对三家一视同仁（现有测试均未发送身份头，将继续走旧路径）。
++- 租约时长取 2 分钟（HTTP 路径仅做 DB 插入与入队，秒级完成）；后台自动重试上限 10 次，退避 `min(1m * 2^attempts, 1h)`；供应商重新投递可突破上限再次尝试。
++- 处理中重复请求返回 `202 Accepted`（2xx 保证 GitHub/GitLab/Bitbucket 均不会因非 2xx 触发额外重投；GitHub 仅接受 2xx）。
++- 可恢复故障返回 `503`（Bitbucket 对 5xx 自动重试两次；GitHub/GitLab 可手动/自动重投，且后台任务不依赖重投也会自愈）。
++- 父事件表在提交守卫命中时也留底（可追踪每次已验签的可部署事件）；非匹配事件、fork、sample 短路不写表，避免噪声。
++- 恢复时对「deployment 已存在」的派发内容以该 deployment 的 `config_snapshot` 为准重建，避免环境配置在事件之后发生变化改变本次部署内容。
++
++## Acceptance Criteria
++
++### AC-1: 同一 delivery 重复投递只部署一次
++- **Type**: `rule`
++- **Given**: 一个携带合法投递身份头、且匹配某应用某环境自动部署的已验签事件
++- **When**: 同一身份头与同一 payload 连续投递两次
++- **Then**: 第一次返回 200 且调用一次 Deployer.Deploy；第二次返回 200 且不再调用 Deploy、不新增 deployment、不再入队
++- **Pass Condition**: `mockDeployer.AssertNumberOfCalls("Deploy", 1)`，结果表恰有 1 行 succeeded 并关联 1 条 deployment
++- **Evidence**: apphandlers 测试输出（github/gitlab/bitbucket 各至少一例）与数据库断言
++
++### AC-2: 并发请求得到处理中响应且不重复部署
++- **Type**: `rule`
++- **Given**: 同一（delivery, app, env）已存在一行 claimed_at 新鲜的 `processing` 结果
++- **When**: 同一身份请求再次到达
++- **Then**: 返回 202，不创建 deployment、不调用 Deploy/ Dispatch，已有 processing 行不被重置
++- **Pass Condition**: HTTP 202 且 mock 零调用；处理者完成后重投转为 200
++- **Evidence**: apphandlers 并发/租约测试
++
++### AC-3: 每个匹配的应用与环境独立留结果并关联原始事件
++- **Type**: `rule`
++- **Given**: 一次 delivery 匹配同一仓库的多个应用/环境
++- **When**: 事件处理完成
++- **Then**: 父事件 1 行（含 provider、delivery id、原始 payload），每个（app, env）各 1 行结果并各自关联自己的 deployment；唯一约束拒绝重复 (delivery, app, env)
++- **Pass Condition**: 结果行数 == 匹配候选数；尝试插入重复键报 23505；每行可经 delivery_id 追溯父事件
++- **Evidence**: 多环境扇出测试 + webhookdelivery store 测试
++
++### AC-4: 同一提交的多个合法环境不被合并
++- **Type**: `rule`
++- **Given**: 同一 commit 在一次 delivery 中匹配两个环境（或两个 app）
++- **When**: 处理该 delivery
++- **Then**: 两个环境分别调用 Deploy 各一次，产生两条 deployment 与两个 succeeded 结果，互不被 `IsDeploymentAlreadyBuilt` 或认领逻辑短路
++- **Pass Condition**: Deploy 调用数 == 2，deployment 数 == 2，env_id 各不相同
++- **Evidence**: 多环境测试
++
++### AC-5: 领取后进程崩溃可经重投/后台恢复且无第二次外部部署
++- **Type**: `rule`
++- **Given**: 结果行为 `processing` 且 claimed_at 已超过租约；并且 deployment 行已存在（带 delivery_result_id）但队列任务缺失
++- **When**: 供应商重新投递（或后台恢复任务扫描到该行）
++- **Then**: 不插入新 deployment；仅以该 deployment 的 config_snapshot 重建并派发一次队列任务（TaskID 冲突视为成功）；结果置 succeeded
++- **Pass Condition**: Deploy 零调用、Dispatch 至多一次（ErrTaskIDConflict 计为成功），deployment 总数不变，结果 succeeded
++- **Evidence**: 恢复路径测试（HTTP 重投 + Recover 函数各一例）
++
++### AC-6: deployment 创建前崩溃可恢复
++- **Type**: `rule`
++- **Given**: 过期 `processing` 结果行无 deployment 关联，且 deployments 表无该结果行的 deployment
++- **When**: 后台恢复或重新投递处理该行
++- **Then**: 从父事件字段重建输入并重新选取候选，创建 deployment（绑定结果行）并入队，结果置 succeeded，全程仅一次外部部署
++- **Pass Condition**: Deploy 路径执行一次，新 deployment.delivery_result_id 指向该结果行
++- **Evidence**: 恢复路径测试
++
++### AC-7: 部署启动失败留下可重试结果并可恢复
++- **Type**: `rule`
++- **Given**: Deployer.Deploy 在首次投递时返回错误
++- **When**: 首次请求返回后，相同 delivery 重新投递（或后台任务重试）
++- **Then**: 首次响应 503，结果行为 retryable 并记录 last_error/attempts/next_retry_at；恢复调用成功后仅产生一次外部部署并置 succeeded
++- **Pass Condition**: 首次 503；重试后 200；Deploy 总调用导致的 deployment 总数 == 1
++- **Evidence**: 失败注入测试（MockDeployer 先失败后成功）
++
++### AC-8: 数据库瞬时失败给可重试响应且不产生悬空成功
++- **Type**: `rule`
++- **Given**: 认领/结果落库或 deployment 插入发生临时数据库错误
++- **When**: 请求处理中
++- **Then**: 返回 503（应用查询错误仍为 500）；已落 processing 认领由租约回收；未落下任何认领时重投等价首次处理；无路径返回 2xx 却未持久化
++- **Pass Condition**: 故障注入下状态码为 503 且重试成功后无重复 deployment
++- **Evidence**: 存储层错误路径测试 + 代码审查证据
++
++### AC-9: 后台恢复任务注册且行为正确
++- **Type**: `rule`
++- **Given**: worker 以 leader 身份运行
++- **When**: 每分钟主任务执行
++- **Then**: 扫描过期 processing 与到期 retryable（attempts < 10）结果行，批量 ≤50、SKIP LOCKED；成功置 succeeded，仍失败按退避更新；succeeded/新鲜 processing/未到期 retryable 不被触碰
++- **When（续）**: attempts 已达 10 的 retryable 行不再被自动重试（供应商重投仍可恢复）
++- **Pass Condition**: 注册于 master 任务列表；job 测试覆盖选取与忽略两类集合
++- **Evidence**: workerserver job 测试 + 注册代码
++
++### AC-10: 无投递身份的旧调用保持提交去重
++- **Type**: `rule`
++- **Given**: GitLab/兼容请求不携带投递身份头，且该 commit 在同 app 已有 deployment（现状 `Test_DoNotRebuildSameCommits` 场景）
++- **When**: 请求到达
++- **Then**: 返回 208，不调用 Deploy，不写事件/结果表
++- **Pass Condition**: 既有用例（三家无身份头的全部测试）零修改通过；认领表无记录
++- **Evidence**: 既有测试套件全绿
++
++### AC-11: 签名校验与非匹配事件不回归
++- **Type**: `rule`
++- **Given**: 缺签名/错签名/未配置 secret/非白名单事件/tag/fork/sample/无候选等场景
++- **When**: 请求到达
++- **Then**: 响应与今天完全一致（403/204 等），且非可部署事件不落任何认领数据；错签名请求 body 不被提前读取的保证不变
++- **Pass Condition**: 既有 github/gitlab/bitbucket 测试全部通过；新增针对「非匹配事件不写表」断言
++- **Evidence**: 既有 + 新增测试
++
++### AC-12: 迁移安全且部署查询不回归
++- **Type**: `rule`
++- **Given**: 0029 迁移在空库与已应用库上执行
++- **When**: 迁移运行（含重复执行）
++- **Then**: 两张新表、约束、索引与 deployments 新 nullable 列创建成功且可重复执行；既有部署列表/详情/手动部署测试全绿
++- **Pass Condition**: 迁移在测试库自动应用成功；`go test` 相关包通过；手动部署产生的 deployment 新列为 NULL
++- **Evidence**: 迁移执行输出 + deploy/deployhandlers 测试
++
++### AC-13: provider 维度与身份头识别正确
++- **Type**: `rule`
++- **Given**: 三家各自的身份头
++- **When**: 解析请求
++- **Then**: provider 名正确参与唯一键（不同 provider 相同 GUID 不冲突）；头值被 trim、空串视为缺失；GitLab 缺头自动降级旧路径
++- **Pass Condition**: 单元测试覆盖各头与空值/缺失；不同 provider 同 GUID 可各自部署
++- **Evidence**: provider 解析测试
++
++### AC-14: 代码与约定一致性
++- **Type**: `rubric`
++- **Dimension**: 代码质量与代码库一致性
++- **Scale**: 1-5
++- **Anchors**: 1 = 分层混乱、绕过既有 store/响应约定、缺测试或注释；3 = 功能正确但风格与周边代码有可见偏差；5 = store/model/statements 分层与 deployhooks/deploy 一致，错误处理与状态码遵循 shttp 约定，命名/空行/注释/测试组织完全贴合 AGENTS.md，新增逻辑被同级测试覆盖
++- **Pass Threshold**: >= 4
++- **Evidence**: 独立审查对照 AGENTS.md 与周边包
++
++## Open Questions
++- 无（实现参数取 Assumptions 中的默认值；如对租约时长、退避上限或 202/503 状态码选择有不同偏好，可在审批时指出）。
+diff --git a/.trae/specs/webhook-delivery-idempotency/tasks.md b/.trae/specs/webhook-delivery-idempotency/tasks.md
+new file mode 100644
+index 0000000..14c6a34
+--- /dev/null
++++ b/.trae/specs/webhook-delivery-idempotency/tasks.md
+@@ -0,0 +1,186 @@
++# Webhook 投递认领与部署幂等性 - 实施计划
++
++## Task 1: 数据库迁移（事件表、结果表、deployments 关联列）
++- **Status**: `completed`
++- **Completion Evidence**:
++  - `src/migrations/0029_2026-10-08.up.sql` 已创建；databasetest 初始化（迁移链 0001→0029）在 Linux 容器内成功，既有 TestInboundGithub 基线通过（TR-1.1 首次应用）。
++  - 在 skitapi schema 下带 ON_ERROR_STOP 二次执行 0029 成功（NOTICE skipping，无错误），幂等性验证通过（TR-1.1）。
++  - 部分唯一索引/唯一约束由 Task 2/3 测试触发 23505 验证（TR-1.2 随后续任务收口）。
++- **Priority**: high
++- **Depends On**: None
++- **Description**:
++  - 新增 `src/migrations/0029_2026-10-08.up.sql`（幂等 SQL + 注释，沿用 0027/0028 风格）：
++    - `webhook_deliveries`：`delivery_id BIGSERIAL PK`、`provider text not null`、`provider_delivery_id text not null`、`repo/checkout_repo/branch/message/event_type/commit_sha text`、`pull_request_number bigint`、`is_fork boolean`、`changes_complete boolean`、`changed_files text[]`、`payload jsonb`、`created_at/updated_at timestamp without time zone default now() UTC`；`UNIQUE(provider, provider_delivery_id)`。
++    - `webhook_delivery_results`：`result_id BIGSERIAL PK`、`delivery_id bigint not null references webhook_deliveries(delivery_id) on delete cascade`、`app_id bigint not null`、`env_id bigint not null`、`env_name text`、`status text not null`、`deployment_id bigint null references deployments(deployment_id) on delete set null`、`attempts int not null default 0`、`last_error text`、`claimed_at/finished_at/next_retry_at timestamp without time zone`、`created_at/updated_at`；`UNIQUE(delivery_id, app_id, env_id)`；索引 `(status, next_retry_at)`。
++    - `ALTER TABLE deployments ADD COLUMN IF NOT EXISTS delivery_result_id bigint null references webhook_delivery_results(result_id) on delete set null`；部分唯一索引 `CREATE UNIQUE INDEX IF NOT EXISTS ... ON deployments(delivery_result_id) WHERE delivery_result_id IS NOT NULL`。
++  - 顺序：先结果表后父表（deployments FK 需要结果表存在），再 ALTER deployments。
++- **Acceptance Criteria Addressed**: AC-3, AC-12
++- **Test Requirements**:
++  - `rule` TR-1.1: 迁移在测试库（databasetest 自动应用全部 *.up.sql）可执行且重复执行不报错；证据：任一相关包测试启动成功 + 手工在测试库二次执行 0029 成功。
++  - `rule` TR-1.2: 两张表与唯一约束、部分唯一索引存在；证据：测试中违反唯一键得到 `database.IsDuplicate`（23505），且两条不同 result 的 deployment 插入正常。
++- **Notes**: 不维护过期快照 structure.sql（与 0024 之后迁移做法一致）。
++
++## Task 2: webhookdelivery 领域包（模型/语句/存储）
++- **Status**: `completed`
++- **Completion Evidence**:
++  - 新增包 `src/ce/api/app/deploy/webhookdelivery/`：delivery_model.go（Delivery/Result + 状态常量）、delivery_statements.go（upsert/claim/reclaim/mark/due 全部 SQL，含 SKIP LOCKED 与租约条件）、delivery_store.go（7 个存储方法 + 统一 scan）。
++  - delivery_store_test.go 7 个用例全部通过（容器内 go test）：首次写入获胜、provider 维度键、claim 新行/既有行/succeeded 行、reclaim 新鲜/过期/retryable/succeeded 守卫、markRetryable 保留 deployment 链接且不回退 succeeded、DueResults 五类集合选取。
++  - gofmt 无差异。TR-2.1~2.5 全部满足。
++- **Priority**: high
++- **Depends On**: Task 1
++- **Description**:
++  - 新包 `src/ce/api/app/deploy/webhookdelivery/`（参照 deployhooks 的 model/statements/store 分层）：
++    - `delivery_model.go`：`Delivery`（父事件，含规范化字段 + `ChangedFiles []string` + `Payload json.RawMessage`）、`Result`（结果行：ID、DeliveryID、AppID、EnvID、EnvName、Status、DeploymentID、Attempts、LastError、ClaimedAt、NextRetryAt、FinishedAt）；状态常量 `StatusProcessing/StatusSucceeded/StatusRetryable`；`ProviderGitHub/GitLab/Bitbucket` 常量。
++    - `delivery_statements.go`：全部 SQL（与 deployment_statements.go 风格一致）。
++    - `delivery_store.go`：`Store{*database.Store}` + `NewStore()`；方法：
++      - `UpsertDelivery(ctx, *Delivery) (types.ID, error)`：首次插入全部字段，冲突仅刷新 updated_at，RETURNING delivery_id；payload 用 jsonb 透传 []byte，changed_files 用 `pq.Array`。
++      - `ResultByKey(ctx, deliveryID, appID, envID) (*Result,error)`（无行返回 nil,nil）。
++      - `ClaimResult(ctx, deliveryID, appID, envID, envName) (*Result,error)`：`INSERT ... ON CONFLICT DO NOTHING` 后回读；新行 status=processing、claimed_at=now、attempts=0。
++      - `ReclaimResult(ctx, resultID, leaseExpiry time.Time) (bool,error)`：条件 UPDATE（status=retryable 或 processing 且 claimed_at<租约），置 processing/claimed_at=now/attempts+1/清空 last_error、next_retryat；返回是否抢到。
++      - `MarkSucceeded(ctx, resultID, deploymentID)`、`MarkRetryable(ctx, resultID, deploymentID, errMsg, nextRetryAt)`。
++      - `DueResults(ctx, limit int, leaseExpiry time.Time, now time.Time, maxAttempts int) ([]*Result,error)`：processing 过租约 或 (retryable 且 next_retry_at<=now 且 attempts<max)，`FOR UPDATE SKIP LOCKED` LIMIT。
++      - `DeliveryByID(ctx, id) (*Delivery,error)`（恢复时重建输入）。
++    - `delivery_store_test.go`（外部测试包 `webhookdelivery_test`，databasetest + factory 风格）：upsert 幂等、claim 并发语义模拟（先 claim 再插返回既有 processing）、reclaim 新鲜/过期/retryable/succeeded 各分支、due 选取集合、状态流转。
++- **Acceptance Criteria Addressed**: AC-2, AC-3, AC-8, AC-9, AC-13
++- **Test Requirements**:
++  - `rule` TR-2.1: 同 (provider,delivery id) 重复 Upsert 只保留首次 payload 与字段但更新 updated_at；证据：store 测试断言。
++  - `rule` TR-2.2: ClaimResult 对已存在（processing/succeeded/retryable）行返回既有状态不覆盖；证据：测试四种状态。
++  - `rule` TR-2.3: ReclaimResult 仅在 retryable 或 processing 过租约时成功并 attempts+1；succeeded 与新鲜 processing 返回 false；证据：测试。
++  - `rule` TR-2.4: DueResults 只返回过租约 processing 与到期且 attempts<10 的 retryable，忽略 succeeded/未到期/达上限，且 SQL 含 SKIP LOCKED；证据：测试 + 语句检查。
++  - `rule` TR-2.5: MarkSucceeded/MarkRetryable 正确写 status/deployment_id/last_error/next_retry_at/finished_at；证据：测试回读断言。
++
++## Task 3: deploy 模型与存储扩展（认领关联 + 派发重建查询）
++- **Status**: `completed`
++- **Completion Evidence**:
++  - Deployment.DeliveryResultID 字段、insertDeployment 第 17 列（0→NULL）、DeploymentForDispatch/DeploymentByDeliveryResult（含 config_snapshot 还原 BuildConfig）。
++  - deployment_dispatch_store_test.go 4 用例通过：同 claim 二次插入触发 database.IsDuplicate、无认领部署为 NULL、派发字段还原、claim 反查。TR-3.1~3.3 满足。
++- **Priority**: high
++- **Depends On**: Task 1
++- **Description**:
++  - `deployment_model.go`：Deployment 增加 `DeliveryResultID types.ID`（json:"-"，0 表示无关联，手动部署保持 0）。
++  - `deployment_statements.go`：`insertDeployment` 增加列 `delivery_result_id`（$17，NULL 传 nil）。
++  - `deployment_store.go`：`InsertDeployment` 传参增加 null 处理；新增：
++    - `DeploymentByDeliveryResult(ctx, resultID types.ID) (*Deployment,error)`：无行 nil,nil。
++    - `DeploymentForDispatch(ctx, id types.ID) (*Deployment,error)`：扫描 deployment_id, app_id, env_id, env_name, branch, checkout_repo, pull_request_number, auto_publish, is_priority, migrations_folder, config_snapshot；并用 `ConfigSnapshot{BuildConfig...}` 从 ConfigCopy 还原 `BuildConfig`（json.Unmarshal），供 deployservice 重建派发消息。
++  - factory 与既有显式列 INSERT 无需改动（新列 nullable）。
++  - 相关测试：`deployment_statements_test.go`/`deployment_model_test.go` 增补关联插入与重复键场景（经 store 层或 SQL 直接断言）。
++- **Acceptance Criteria Addressed**: AC-5, AC-12
++- **Test Requirements**:
++  - `rule` TR-3.1: InsertDeployment 带 DeliveryResultID 后可回读；重复绑定同一 result 的第二条 deployment 触发 23505（`database.IsDuplicate` 为 true）；手动/工厂创建的 deployment 该列为 NULL；证据：deploy 包测试。
++  - `rule` TR-3.2: DeploymentForDispatch/DeploymentByDeliveryResult 返回的 Deployment 可还原 BuildConfig（含 BuildCmd/Vars/WorkDir 等）与派发所需全部字段；证据：deploy 包测试。
++  - `rule` TR-3.3: 既有部署列表/状态查询扫描列不变、测试通过；证据：deploy/deployhandlers 既有测试全绿。
++
++## Task 4: deployservice 拆分创建/派发并扩展 Deployer 接口
++- **Status**: `completed`
++- **Completion Evidence**:
++  - DefaultDeployer 拆为 createDeployment/dispatchDeployment；Deploy=两者；新增 Dispatch；ErrTaskIDConflict 归一为成功；cache/credential 逻辑自包含。
++  - Deployer 接口增加 Dispatch，mocks.Deployer 手工补全；新增 Dispatch 冲突/错误两单测；deployservice 整包（需 Redis）通过。TR-4.1~4.3 满足。
++- **Priority**: high
++- **Depends On**: Task 3
++- **Description**:
++  - `deployer.go`：将 `DefaultDeployer.Deploy` 重构为：
++    - `createDeployment(ctx, a, d) error`：现 42-126 行全部逻辑（额度、repo size、凭证、ConfigSnapshot、InsertDeployment）；插入时携带 `d.DeliveryResultID`。
++    - `dispatchDeployment(ctx, a, d) error`：构造 DeploymentMessage + 入队（现 128-184 行）。
++    - `Deploy = createDeployment + dispatchDeployment`（行为不变）。
++    - 新增 `Dispatch(ctx, a, d) error`（供恢复路径调用；内部即 dispatchDeployment）。
++    - 归一化：dispatchDeployment 遇 `errors.Is(err, asynq.ErrTaskIDConflict)` 返回 nil（该 deployment 的任务已在队/在执行，视为已派发），其余错误照常返回。
++  - `Deployer` 接口增加 `Dispatch(context.Context, *app.App, *deploy.Deployment) error`；`mocks/deployer.go` 按现有生成风格手工补充 Dispatch mock 方法。
++  - 单测：deployer_test.go 增补 Dispatch 冲突归一（可用 seams 或 mock task client，参照现有测试写法）。
++- **Acceptance Criteria Addressed**: AC-5, AC-6
++- **Test Requirements**:
++  - `rule` TR-4.1: Deploy 行为与重构前一致（既有 deployer_test 与全部 webhook 套件通过）；证据：测试全绿。
++  - `rule` TR-4.2: Dispatch 遇 ErrTaskIDConflict 返回 nil，其余入队错误返回错误；证据：deployservice 单测。
++  - `rule` TR-4.3: 编译期保证 DefaultDeployer 与 mocks.Deployer 均实现扩展后接口；证据：编译通过。
++
++## Task 5: provider 解析层提取投递身份与原始 payload
++- **Status**: `completed`
++- **Completion Evidence**:
++  - TriggerDeployInput 增加 Provider/deliveryID/payloadRaw；GitHub verifier 返回验签 body，三家处理器在验签后捕获原始字节并重置 body；身份头 X-GitHub-Delivery/X-Gitlab-Event-UUID/X-Request-UUID 经 trim，空值即旧路径。
++  - 内部测试覆盖 gitlab/bitbucket 头映射与 payloadRaw；三家既有 webhook 套件（含签名/非匹配/204）全绿，body 捕获无回归。TR-5.1~5.3 满足。
++- **Priority**: high
++- **Depends On**: None
++- **Description**:
++  - `TriggerDeployInput` 增加导出字段 `Provider string`（"github"/"gitlab"/"bitbucket"）与非导出 `deliveryID string`、`payloadRaw json.RawMessage`；新增包内访问器供编排层使用（同包直接读字段即可，保持非导出）。
++  - GitHub：`processGithubPayload` 设置 Provider，并读取 `X-GitHub-Delivery`（trim、空串视为缺失）；原始 body 已在 verifier 中读出，调整为可复用（verifier 成功后 body 已重置为 bytes.Reader；处理器解析前读出全部字节→再重置→hook.Parse，解析后保留 payloadRaw；签名计算所用字节与解析字节必须为同一份）。
++  - GitLab：读 `X-Gitlab-Event-UUID`；hook.Parse 前用 bytes 读取并重置 req.Request.Body（受 maxWebhookPayloadSize 约束）。
++  - Bitbucket：读 `X-Request-UUID`，同样捕获/重置 body。
++  - 单测：三家头识别（有/无/空白）、provider 名正确、payloadRaw 与请求体一致、无身份头时旧行为不变。
++- **Acceptance Criteria Addressed**: AC-10, AC-11, AC-13
++- **Test Requirements**:
++  - `rule` TR-5.1: 三家身份头分别映射到 input 的 provider+deliveryID；空/缺时 deliveryID 为空；证据：provider 解析测试。
++  - `rule` TR-5.2: 捕获原始 body 不破坏 hook.Parse（现有全部签名/事件测试不变），payloadRaw 为验签所用同一字节；证据：既有 github/gitlab/bitbucket 套件全绿 + 断言。
++  - `rule` TR-5.3: 捕获 body 后非匹配事件仍 204；错签名仍 403 且 body 不被提前读取（GitHub）；证据：既有用例。
++
++## Task 6: delivery 编排：认领式 TriggerDeploy 与 HTTP 语义
++- **Status**: `completed`
++- **Completion Evidence**:
++  - handler_inbound_webhooks_delivery.go：认领编排（upsert→提交守卫→候选→新建/在飞/可重试认领→Deploy→MarkSucceeded/Retryable）、200/202/204/208/503 聚合、RecoverPendingWebhookDeliveries（deployment 已存在仅 Dispatch，不存在则重放事件）；legacyTriggerDeploy 逐行保留。
++  - ClaimResult 增加 created 标志修正「新建 claim 被自己当作在飞」缺陷；MarkSucceeded 将 0 deployment 归一为 NULL 避免 FK 违规。
++  - 新增 HTTP/恢复测试：重复投递、并发 202、多环境扇出、失败→503→重投 200、无候选 204、GitLab 提交守卫 208、三家身份头用例、两类崩溃窗口恢复、恢复跳过集合。apphandlers 整包通过。TR-6.1~6.5 满足（rubric 留待独立审查评分）。
++- **Priority**: high
++- **Depends On**: Task 2, Task 4, Task 5
++- **Description**:
++  - 新文件 `handler_inbound_webhooks_delivery.go`（package apphandlers）：
++    - `TriggerDeploy` 在 sample/fork 短路之后按 `input.deliveryID == ""` 分流：旧逻辑保持为独立函数（legacyTriggerDeploy，行为/响应码逐行不变）；非空走 `triggerDeployWithClaims`。
++    - `triggerDeployWithClaims(ctx, input)`：
++      1. UpsertDelivery（失败→503）。
++      2. 跨事件提交守卫（复用 commitHasBeenBuilt，命中→208，语义同 FR-13）。
++      3. DeployCandidates + FilterDeployCandidates（含 AppID scoping、ShouldPublish 判定，逻辑不变）；无候选→204（父事件已留底）。
++      4. 逐候选 ClaimResult：既有 succeeded→计数跳过；新鲜 processing→inProgress 计数；retryable/过期 processing→ReclaimResult，抢不到记 inProgress；新行→处理。
++      5. 处理单个认领 `processClaim`：构造 depl（PopulateFromDeployCandidate，WebhookEvent 用父事件 payload 重放：首次用 input.payload，重放用 json.Unmarshal(payloadRaw) 的通用 map）；设置 `depl.DeliveryResultID=result.ID`：
++         - 调用 Deployer.Deploy；成功→MarkSucceeded（含 depl.ID）；GitHub pending status 逻辑仅在本次实际派发成功时执行。
++         - Deploy 错误：区分 deployment 是否已创建（depl.ID!=0 或按 resultID 反查）→MarkRetryable(deploymentID, err, backoff)→503；未创建同样 retryable（deployment_id 空）。
++      6. 响应聚合：任一 retryable→503；否则 inProgress>0→202；否则有成功（本次或既往）→200；其余→204。
++    - 导出 `RecoverPendingWebhookDeliveries(ctx) error`（Task 7 使用）：DueResults→逐行 ReclaimResult→有 deployment（result.DeploymentID 或 DeploymentByDeliveryResult）则加载 app+DeploymentForDispatch 后 `Deployer.Dispatch`（冲突归一在 Task 4 内）；无 deployment 则 DeliveryByID 重建 TriggerDeployInput（payload 通用 map、provider 等字段还原）→重新选取候选并定位该 (app,env) 候选→processClaim；成功/失败按同一 Mark* 更新；循环内错误不中断整批（记日志继续）。
++    - 退避：`min(1m*2^attempts, 1h)`；常量：租约 2 分钟、最大自动尝试 10 次、恢复批量 50。
++  - HTTP 测试（apphandlers_test，扩展 InboundGithubSuite 为主，并在 gitlab/bitbucket 套件各加身份头用例）：
++    - 重复同 delivery：200/200、Deploy 一次、结果表与 deployment 各 1（AC-1）。
++    - 预置新鲜 processing：202、零调用（AC-2）。
++    - 一次两环境：Deploy 两次、两条结果两条 deployment（AC-4）。
++    - Deploy 首次失败→503+retryable；改 mock 成功重投→200 且 deployment 仅 1（AC-7）。
++    - 不同 provider 同 GUID 互不干扰（AC-13）。
++    - 无候选/tag/非匹配 204 且无结果行（父事件留底仅限可部署事件：非匹配事件在解析阶段返回 nil，不进 TriggerDeploy，天然不写表——验证即可）。
++    - 提交守卫：带身份头但同 commit 已有 deployment→208（AC-13/FR-13）。
++    - 恢复函数：过期 processing 且 deployment 已存在→只 Dispatch；不存在→Deploy；成功后 succeeded（AC-5/6）。
++- **Acceptance Criteria Addressed**: AC-1, AC-2, AC-4, AC-5, AC-6, AC-7, AC-8, AC-10, AC-11, AC-13, AC-14
++- **Test Requirements**:
++  - `rule` TR-6.1: AC-1/AC-2/AC-4/AC-7 对应全部 HTTP 级用例通过，MockDeployer 调用次数与参数（AppID、EnvID、DeliveryResultID）有断言；证据：测试输出。
++  - `rule` TR-6.2: legacyTriggerDeploy 路径下认领表零写入且 208/200/204 响应与现状一致（既有 GitLab Test_DoNotRebuildSameCommits 等不改一字通过）；证据：既有套件全绿。
++  - `rule` TR-6.3: processClaim 两阶段故障窗口（depl.ID 已有时只 Dispatch；无 ID 时 Deploy）均无重复 deployment；证据：恢复用例 + deployment 计数断言。
++  - `rule` TR-6.4: 503 仅用于认领/部署可恢复故障；app 查询错误仍 500、签名错误 403；证据：用例与代码审查。
++  - `rubric` TR-6.5: 编排代码可读性与约定一致性；scale 1-5；anchors 同 AC-14；threshold >=4；证据：独立审查。
++
++## Task 7: 后台恢复 job（leader 每分钟）
++- **Status**: `completed`
++- **Completion Evidence**:
++  - job_webhook_deliveries.go 薄封装 RecoverWebhookDeliveries；worker_scheduler master 列表每分钟注册（EE 经 jobs.Server 自动获得）。
++  - job 测试覆盖过期 claim 被恢复、新鲜 claim 不触碰；workerserver 整包（含 Redis 依赖套件）host 网络下全绿。TR-7.1~7.3 满足（SKIP LOCKED/批量上限见语句与 DueResults 测试）。
++- **Priority**: medium
++- **Depends On**: Task 6
++- **Description**:
++  - `src/ce/workerserver/job_webhook_deliveries.go`：`RecoverWebhookDeliveries(ctx) error` 薄封装调用 `apphandlers.RecoverPendingWebhookDeliveries`（确认 jobs→apphandlers 无导入环；若有环则把恢复编排下沉到 webhookdelivery 可导入的形式并由 apphandlers 提供薄函数，jobs 只依赖该包）。
++  - `worker_scheduler.go` master 任务列表增加 `{Handler: RecoverWebhookDeliveries, Def: gocron.DurationJob(EVERY_MINUTE), Opt: immediate}`。
++  - 测试：`job_webhook_deliveries_test.go`（databasetest + factory，参照 job_deployments_test.go）：构造过期 processing / 到期 retryable / succeeded / 新鲜 processing / attempts 达上限五类结果行，运行后断言仅应处理的行被恢复（配合 MockDeployer/Dispatch mock 或直接断言状态变迁；在不依赖 Redis 的前提下，可令处理路径经 MockDeployer 成功）。
++- **Acceptance Criteria Addressed**: AC-5, AC-6, AC-9
++- **Test Requirements**:
++  - `rule` TR-7.1: job 执行后过租约 processing 与到期 retryable（attempts<10）被恢复为 succeeded 或按当前错误更新退避；succeeded/新鲜/达上限行不变；证据：job 测试。
++  - `rule` TR-7.2: 任务出现在 RegisterMasterTasks 列表且 EE worker 经 jobs.Server 自动获得；证据：代码审查 + start/调度相关编译。
++  - `rule` TR-7.3: 单批上限 50、SKIP LOCKED、单条失败不影响整批；证据：job 测试（注入一行坏数据仍处理其余）与语句审查。
++
++## Task 8: 全量回归与编译验证
++- **Status**: `completed`
++- **Completion Evidence**:
++  - Linux golang 1.26 容器 + 专用 Postgres/Redis，`-p=1` 整树回归 ./src/ce/api/app/... + workerserver：全部受影响包（app/apphandlers/deploy/webhookdelivery/deployservice/workerserver/volumeshandlers 等）通过；唯一失败 TestHandlerDeployStart/Test_Zip、Test_Zip_AutoPublish 在干净基线 worktree 上同样失败（依赖本地 runner 二进制，环境性既有问题）。
++  - public/v1 全包在基线同样超时挂起（MCP SSE 套件跨套件干扰），失败测试隔离运行在两边均通过，与本次改动无关。
++  - `go vet -tags=imageopt,alibaba` 受影响包零告警；`gofmt -l` 零差异；`go build -tags=alibaba ./...` 全模块编译通过（imageopt 标签在裸容器缺 libvips，属环境限制）。TR-8.1~8.3 满足。
++- **Priority**: high
++- **Depends On**: Task 6, Task 7
++- **Description**:
++  - Windows 主机：`GOOS=linux go vet ./src/ce/api/app/... ./src/ce/workerver/... ./src/lib/...` 与 `GOOS=linux go test -tags=imageopt,alibaba -c -o NUL` 编译全部受影响测试包。
++  - Linux golang 容器（挂载本仓库，连接专用 Postgres 容器/本项目 .env 库）跑：`go test -tags=imageopt,alibaba -count=1 ./src/ce/api/app/apphandlers/... ./src/ce/api/app/deploy/... ./src/ce/api/app/deployservice/... ./src/ce/workerserver/...`。
++  - 运行既有 webhook 三家套件确认零修改通过；检查 gofmt。
++- **Acceptance Criteria Addressed**: AC-1..AC-14（验证收口）
++- **Test Requirements**:
++  - `rule` TR-8.1: 受影响包全部测试通过、0 失败；证据：容器内 go test 完整输出。
++  - `rule` TR-8.2: 新增/修改文件 gofmt 无差异、go vet 无告警；证据：命令输出。
++  - `rule` TR-8.3: 迁移在空库全新应用成功（databasetest init 路径即为证据）。
+diff --git a/src/ce/api/app/apphandlers/handler_inbound_webhooks.go b/src/ce/api/app/apphandlers/handler_inbound_webhooks.go
+index d5ee118..91aca44 100644
+--- a/src/ce/api/app/apphandlers/handler_inbound_webhooks.go
++++ b/src/ce/api/app/apphandlers/handler_inbound_webhooks.go
+@@ -2,6 +2,7 @@ package apphandlers
+ 
+ import (
+ 	"context"
++	"encoding/json"
+ 	"errors"
+ 	"fmt"
+ 	"net/http"
+@@ -40,6 +41,7 @@ const typePullRequest = "pull_request"
+ // TriggerDeployInput represents the input for the TriggerDeploy function.
+ type TriggerDeployInput struct {
+ 	Fail              bool   // used to debug leaving failure pr comments
++	Provider          string // Provider is the git provider that delivered the event (github, gitlab, bitbucket).
+ 	Repo              string // represents the base repository that the app is created
+ 	CheckoutRepo      string // represents the repository that will be checked out
+ 	IsFork            bool   // whether or not this deployment is a fork
+@@ -56,6 +58,16 @@ type TriggerDeployInput struct {
+ 	AppID types.ID
+ 
+ 	payload any // The payload that is sent by the provider - we store this in the database.
++
++	// deliveryID is the provider-assigned identity of this delivery
++	// (X-GitHub-Delivery, X-Gitlab-Event-UUID, X-Request-UUID). Empty means an
++	// old or compatible client without the header, which keeps the legacy
++	// commit-based dedup.
++	deliveryID string
++
++	// payloadRaw is the verified request body. It is the original event the
++	// delivery inbox persists for crash recovery.
++	payloadRaw json.RawMessage
+ }
+ 
+ // NewTriggerDeployInput is a helper function to
+@@ -168,6 +180,10 @@ func (v webhookVerifier) app() (*app.App, error) {
+ 
+ // TriggerDeploy triggers a new deploy given the repository, and the branch name.
+ // See tests for an example input event.
++//
++// Events carrying a provider delivery identity take the persistent claim path
++// (exactly one deployment per delivery/app/environment, crash-recoverable).
++// Events without the identity keep the legacy commit-based dedup.
+ func TriggerDeploy(ctx context.Context, input TriggerDeployInput) *shttp.Response {
+ 	// Do not deploy automatically sample projects
+ 	if input.Repo == app.SampleProjectRepo {
+@@ -180,6 +196,18 @@ func TriggerDeploy(ctx context.Context, input TriggerDeployInput) *shttp.Respons
+ 		return nil
+ 	}
+ 
++	if input.deliveryID == "" {
++		return legacyTriggerDeploy(ctx, input)
++	}
++
++	return triggerDeployWithClaims(ctx, input)
++}
++
++// legacyTriggerDeploy is the pre-claim path used by providers and compatible
++// clients that do not send a per-delivery identity. Its behaviour is
++// intentionally unchanged: commit-based dedup followed by one Deploy per
++// matched candidate.
++func legacyTriggerDeploy(ctx context.Context, input TriggerDeployInput) *shttp.Response {
+ 	// This is mostly for GitLab as we may end up deploying the same commit again and
+ 	// again because GitLab sends the same payload.
+ 	if alreadyBuilt, err := commitHasBeenBuilt(ctx, input); err != nil || alreadyBuilt {
+diff --git a/src/ce/api/app/apphandlers/handler_inbound_webhooks_bitbucket.go b/src/ce/api/app/apphandlers/handler_inbound_webhooks_bitbucket.go
+index 23bae2f..e38a8a8 100644
+--- a/src/ce/api/app/apphandlers/handler_inbound_webhooks_bitbucket.go
++++ b/src/ce/api/app/apphandlers/handler_inbound_webhooks_bitbucket.go
+@@ -5,6 +5,7 @@ import (
+ 	"fmt"
+ 	"strings"
+ 
++	"github.com/stormkit-io/stormkit-io/src/ce/api/app/deploy/webhookdelivery"
+ 	"github.com/stormkit-io/stormkit-io/src/lib/shttp"
+ 	"github.com/stormkit-io/stormkit-io/src/lib/slog"
+ 	"gopkg.in/go-playground/webhooks.v5/bitbucket"
+@@ -12,6 +13,15 @@ import (
+ 
+ // processBitbucketPayload processes a bitbucket payload and starts a new deployment.
+ func processBitbucketPayload(req *shttp.RequestContext) (*TriggerDeployInput, error) {
++	// The per-app secret was verified before this parser runs, so the body is
++	// only read now. Capture it for the delivery inbox and restore it for the
++	// provider parser.
++	body, err := readAndRestoreBody(req)
++
++	if err != nil {
++		return nil, err
++	}
++
+ 	hook, _ := bitbucket.New()
+ 	payload, err := hook.Parse(
+ 		req.Request,
+@@ -33,7 +43,10 @@ func processBitbucketPayload(req *shttp.RequestContext) (*TriggerDeployInput, er
+ 	}
+ 
+ 	input := TriggerDeployInput{
+-		payload: payload,
++		Provider:   webhookdelivery.ProviderBitbucket,
++		deliveryID: deliveryHeader(req.Header.Get("X-Request-UUID")),
++		payloadRaw: body,
++		payload:    payload,
+ 	}
+ 
+ 	switch event := payload.(type) {
+diff --git a/src/ce/api/app/apphandlers/handler_inbound_webhooks_delivery.go b/src/ce/api/app/apphandlers/handler_inbound_webhooks_delivery.go
+new file mode 100644
+index 0000000..c924845
+--- /dev/null
++++ b/src/ce/api/app/apphandlers/handler_inbound_webhooks_delivery.go
+@@ -0,0 +1,495 @@
++package apphandlers
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"net/http"
++	"time"
++
++	"github.com/stormkit-io/stormkit-io/src/ce/api/admin"
++	"github.com/stormkit-io/stormkit-io/src/ce/api/app"
++	"github.com/stormkit-io/stormkit-io/src/ce/api/app/deploy"
++	"github.com/stormkit-io/stormkit-io/src/ce/api/app/deploy/webhookdelivery"
++	"github.com/stormkit-io/stormkit-io/src/ce/api/app/deployservice"
++	"github.com/stormkit-io/stormkit-io/src/ce/api/oauth/github"
++	"github.com/stormkit-io/stormkit-io/src/lib/shttp"
++	"github.com/stormkit-io/stormkit-io/src/lib/slog"
++	"github.com/stormkit-io/stormkit-io/src/lib/types"
++)
++
++const (
++	// webhookClaimLease is how long a processing claim is owned before a
++	// duplicate delivery or the background job may take it over. HTTP
++	// processing only inserts a row and enqueues a task, so this is well
++	// beyond its normal duration.
++	webhookClaimLease = 2 * time.Minute
++
++	// webhookMaxAttempts caps automatic background retries. A provider
++	// redelivery is always allowed to reclaim regardless of the cap.
++	webhookMaxAttempts = 10
++
++	// webhookRecoveryBatchSize bounds how many claims one recovery run takes.
++	webhookRecoveryBatchSize = 50
++)
++
++// webhookNextRetry computes the backoff of an attempt: 1m, 2m, 4m, ... capped
++// at one hour.
++func webhookNextRetry(attempts int) time.Time {
++	backoff := time.Minute
++
++	for i := 0; i < attempts && backoff < time.Hour; i++ {
++		backoff *= 2
++	}
++
++	if backoff > time.Hour {
++		backoff = time.Hour
++	}
++
++	return time.Now().UTC().Add(backoff)
++}
++
++func webhookAccepted() *shttp.Response {
++	return &shttp.Response{Status: http.StatusAccepted}
++}
++
++func webhookRetryable() *shttp.Response {
++	return &shttp.Response{
++		Status: http.StatusServiceUnavailable,
++		Data: map[string]any{
++			"error": "deployment is being processed or temporarily unavailable; redeliver to retry",
++		},
++	}
++}
++
++// triggerDeployWithClaims is the idempotent path for events carrying a
++// provider delivery identity. Every matched application/environment gets its
++// own persistent claim, and deployments are created at most once per claim.
++func triggerDeployWithClaims(ctx context.Context, input TriggerDeployInput) *shttp.Response {
++	claimStore := webhookdelivery.NewStore()
++
++	deliveryID, err := claimStore.UpsertDelivery(ctx, deliveryFromInput(input))
++
++	if err != nil {
++		slog.Errorf("could not persist webhook delivery %s/%s: %v", input.Provider, input.deliveryID, err)
++		return webhookRetryable()
++	}
++
++	// Cross-delivery guard: GitLab can deliver the same commit under a new
++	// event UUID (for example an event triggered by an earlier webhook), which
++	// the per-delivery claims cannot dedupe. The guard keeps the legacy
++	// semantics; within a single delivery the multi-environment fan-out below
++	// happens before any deployment exists.
++	if alreadyBuilt, err := commitHasBeenBuilt(ctx, input); err != nil {
++		return shttp.Error(err)
++	} else if alreadyBuilt {
++		return &shttp.Response{Status: http.StatusAlreadyReported}
++	}
++
++	candidates, err := app.NewStore().DeployCandidates(ctx, input.Repo)
++
++	if err != nil {
++		return shttp.Error(err, fmt.Sprintf("error while fetching deploy candidates: %s", err.Error()))
++	}
++
++	outcome := processDeployCandidates(ctx, input, claimStore, deliveryID, FilterDeployCandidates(input, candidates), time.Now().UTC())
++
++	return outcome.response()
++}
++
++// claimOutcome aggregates what happened to the matched claims of one delivery.
++type claimOutcome struct {
++	succeeded  int
++	inProgress int
++	failed     int
++}
++
++func (o claimOutcome) response() *shttp.Response {
++	if o.failed > 0 {
++		return webhookRetryable()
++	}
++
++	if o.inProgress > 0 {
++		return webhookAccepted()
++	}
++
++	if o.succeeded > 0 {
++		return shttp.OK()
++	}
++
++	return shttp.NoContent()
++}
++
++// processDeployCandidates claims and deploys every matched candidate. It is
++// shared verbatim by the HTTP path and the background recovery path when a
++// missing deployment has to be recreated.
++func processDeployCandidates(ctx context.Context, input TriggerDeployInput, claimStore *webhookdelivery.Store, deliveryID types.ID, candidates []*app.DeployCandidate, now time.Time) claimOutcome {
++	var outcome claimOutcome
++
++	for _, candidate := range candidates {
++		if input.AppID != 0 && candidate.ID != input.AppID {
++			continue
++		}
++
++		result, created, err := claimStore.ClaimResult(ctx, deliveryID, candidate.ID, candidate.EnvID, candidate.EnvName)
++
++		if err != nil {
++			slog.Errorf("could not claim delivery %d for app %d env %d: %v", deliveryID, candidate.ID, candidate.EnvID, err)
++			outcome.failed++
++
++			continue
++		}
++
++		// This request inserted the claim, so it owns it regardless of the
++		// processing status it was created with.
++		if created {
++			if err := processClaim(ctx, input, claimStore, candidate, result); err != nil {
++				outcome.failed++
++
++				continue
++			}
++
++			outcome.succeeded++
++
++			continue
++		}
++
++		if result.Status == webhookdelivery.StatusSucceeded {
++			outcome.succeeded++
++
++			continue
++		}
++
++		// A fresh processing claim is owned by another in-flight request.
++		if result.Status == webhookdelivery.StatusProcessing && claimIsFresh(result, now) {
++			outcome.inProgress++
++
++			continue
++		}
++
++		// Retryable claims and expired leases are taken over here.
++		acquired, retaken, err := claimStore.ReclaimResult(ctx, result.ID, now.Add(-webhookClaimLease))
++
++		if err != nil {
++			slog.Errorf("could not reclaim result %d: %v", result.ID, err)
++			outcome.failed++
++
++			continue
++		}
++
++		if !acquired {
++			outcome.inProgress++
++
++			continue
++		}
++
++		if err := resumeClaimedResult(ctx, claimStore, retaken, &input, candidate); err != nil {
++			outcome.failed++
++
++			continue
++		}
++
++		outcome.succeeded++
++	}
++
++	return outcome
++}
++
++// claimIsFresh reports whether a processing claim is still within its lease.
++func claimIsFresh(result *webhookdelivery.Result, now time.Time) bool {
++	return result.ClaimedAt.Valid && result.ClaimedAt.Time.After(now.Add(-webhookClaimLease))
++}
++
++// processClaim creates the deployment for one claimed candidate and dispatches
++// it. The claim is the only thing the caller owns: on failure it becomes
++// retryable with whatever deployment id was obtained, so a retry never inserts
++// a second deployment.
++func processClaim(ctx context.Context, input TriggerDeployInput, claimStore *webhookdelivery.Store, candidate *app.DeployCandidate, result *webhookdelivery.Result) error {
++	depl := deploy.New(candidate.App)
++	depl.PopulateFromDeployCandidate(candidate, deploy.DeployCandidatePayload{
++		Branch:            input.Branch,
++		CommitSha:         input.CommitSha,
++		WebhookEvent:      input.payload,
++		CheckoutRepo:      input.CheckoutRepo,
++		IsFork:            input.IsFork,
++		PullRequestNumber: input.PullRequestNumber,
++	})
++
++	if candidate.EnvDefaultBranch != input.Branch {
++		depl.ShouldPublish = false
++	}
++
++	depl.DeliveryResultID = result.ID
++
++	if err := deployservice.New().Deploy(ctx, candidate.App, depl); err != nil {
++		markClaimRetryable(ctx, claimStore, result, depl.ID, err)
++
++		return err
++	}
++
++	if err := claimStore.MarkSucceeded(ctx, result.ID, depl.ID); err != nil {
++		// The deployment exists and was dispatched; the lease reaper closes
++		// the claim. Tell the provider to redeliver so this request is not
++		// acknowledged as finished.
++		markClaimRetryable(ctx, claimStore, result, depl.ID, err)
++
++		return err
++	}
++
++	createGithubPendingStatus(ctx, candidate.App, depl)
++
++	return nil
++}
++
++// markClaimRetryable records a recoverable failure. When the deployment insert
++// is already linked, or discoverable through the claim column, that id is kept
++// so recovery only re-dispatches instead of inserting again.
++func markClaimRetryable(ctx context.Context, claimStore *webhookdelivery.Store, result *webhookdelivery.Result, deploymentID types.ID, cause error) {
++	slog.Errorf("auto deployment failed for app %d env %d claim %d: %v", result.AppID, result.EnvID, result.ID, cause)
++
++	if deploymentID == 0 {
++		if existing, err := deploy.NewStore().DeploymentByDeliveryResult(ctx, result.ID); err == nil && existing != nil {
++			deploymentID = existing.ID
++		}
++	}
++
++	nextRetry := webhookNextRetry(result.Attempts)
++
++	if err := claimStore.MarkRetryable(ctx, result.ID, deploymentID, cause.Error(), &nextRetry); err != nil {
++		slog.Errorf("could not mark claim %d retryable: %v", result.ID, err)
++	}
++}
++
++// createGithubPendingStatus posts the pending commit status for GitHub repos,
++// best-effort and only when the deployment was actually dispatched.
++func createGithubPendingStatus(ctx context.Context, a *app.App, depl *deploy.Deployment) {
++	cnf := admin.MustConfig()
++
++	if a.IsGithub() && cnf.IsGithubEnabled() {
++		if err := github.CreateStatus(a.Repo, depl.Branch, cnf.DeploymentLogsURL(depl.AppID, depl.ID), github.StatusPending); err != nil {
++			slog.Errorf("error while updating github status: %s", err.Error())
++		}
++	}
++}
++
++func deliveryFromInput(input TriggerDeployInput) *webhookdelivery.Delivery {
++	return &webhookdelivery.Delivery{
++		Provider:          input.Provider,
++		ProviderDelivery:  input.deliveryID,
++		Repo:              input.Repo,
++		CheckoutRepo:      input.CheckoutRepo,
++		Branch:            input.Branch,
++		Message:           input.Message,
++		EventType:         input.EventType,
++		CommitSha:         input.CommitSha,
++		PullRequestNumber: input.PullRequestNumber,
++		IsFork:            input.IsFork,
++		ChangesComplete:   input.ChangesComplete,
++		ChangedFiles:      input.ChangedFiles,
++		Payload:           input.payloadRaw,
++	}
++}
++
++func triggerInputFromDelivery(d *webhookdelivery.Delivery) TriggerDeployInput {
++	var event any
++
++	if len(d.Payload) > 0 {
++		var parsed any
++
++		if err := json.Unmarshal(d.Payload, &parsed); err == nil {
++			event = parsed
++		}
++	}
++
++	return TriggerDeployInput{
++		Provider:          d.Provider,
++		Repo:              d.Repo,
++		CheckoutRepo:      d.CheckoutRepo,
++		Branch:            d.Branch,
++		Message:           d.Message,
++		EventType:         d.EventType,
++		CommitSha:         d.CommitSha,
++		PullRequestNumber: d.PullRequestNumber,
++		IsFork:            d.IsFork,
++		ChangesComplete:   d.ChangesComplete,
++		ChangedFiles:      d.ChangedFiles,
++		payload:           event,
++		deliveryID:        d.ProviderDelivery,
++		payloadRaw:        d.Payload,
++	}
++}
++
++// RecoverPendingWebhookDeliveries resumes stale processing claims and due
++// retryable claims. It runs on the leader worker every minute but is safe to
++// invoke from a redelivery too: every transition is claim-gated.
++func RecoverPendingWebhookDeliveries(ctx context.Context) error {
++	claimStore := webhookdelivery.NewStore()
++	now := time.Now().UTC()
++
++	results, err := claimStore.DueResults(ctx, now.Add(-webhookClaimLease), now, webhookMaxAttempts, webhookRecoveryBatchSize)
++
++	if err != nil {
++		return err
++	}
++
++	for _, result := range results {
++		if err := recoverClaim(ctx, claimStore, result, now); err != nil {
++			slog.Errorf("could not recover webhook claim %d: %v", result.ID, err)
++		}
++	}
++
++	return nil
++}
++
++// recoverClaim handles a single due claim. A deployment that already exists is
++// only re-dispatched; otherwise the stored event is rebuilt and replayed for
++// the claim's app/environment.
++func recoverClaim(ctx context.Context, claimStore *webhookdelivery.Store, due *webhookdelivery.Result, now time.Time) error {
++	acquired, result, err := claimStore.ReclaimResult(ctx, due.ID, now.Add(-webhookClaimLease))
++
++	if err != nil {
++		return err
++	}
++
++	if !acquired {
++		return nil
++	}
++
++	// Background recovery passes no candidate: resumeClaimedResult rebuilds the
++	// stored event only when the deployment does not exist yet.
++	return resumeClaimedResult(ctx, claimStore, result, nil, nil)
++}
++
++// resumeClaimedResult finishes a claim after ownership was taken. When the
++// deployment already exists (the insert succeeded before a crash or a failed
++// dispatch), it is re-dispatched only and no second deployment is ever
++// inserted. Otherwise the candidate's event is deployed. The HTTP path passes
++// the already-resolved candidate and input; recovery passes nil for both and
++// the stored event is rebuilt lazily.
++func resumeClaimedResult(ctx context.Context, claimStore *webhookdelivery.Store, result *webhookdelivery.Result, input *TriggerDeployInput, candidate *app.DeployCandidate) error {
++	depl, err := deploymentForClaim(ctx, result)
++
++	if err != nil {
++		return err
++	}
++
++	if depl != nil {
++		a := candidateApp(candidate, depl.AppID)
++
++		if a == nil {
++			a, err = app.NewStore().AppByID(ctx, depl.AppID)
++
++			if err != nil {
++				markClaimRetryable(ctx, claimStore, result, depl.ID, err)
++
++				return err
++			}
++		}
++
++		if a == nil {
++			markClaimRetryable(ctx, claimStore, result, depl.ID, errors.New("application no longer exists"))
++
++			return nil
++		}
++
++		if err := deployservice.New().Dispatch(ctx, a, depl); err != nil {
++			markClaimRetryable(ctx, claimStore, result, depl.ID, err)
++
++			return err
++		}
++
++		return claimStore.MarkSucceeded(ctx, result.ID, depl.ID)
++	}
++
++	if candidate == nil {
++		recoveredInput, recoveredCandidate, err := resolveRecoveryCandidate(ctx, claimStore, result)
++
++		if err != nil {
++			return err
++		}
++
++		if recoveredCandidate == nil {
++			// The app/environment no longer matches the stored event (deleted,
++			// auto deploy disabled, branch config changed). Retry with backoff
++			// until the attempt cap; a provider redelivery can still reclaim.
++			markClaimRetryable(ctx, claimStore, result, 0, errors.New("stored webhook event no longer matches an application/environment"))
++
++			return nil
++		}
++
++		input = recoveredInput
++		candidate = recoveredCandidate
++	}
++
++	return processClaim(ctx, *input, claimStore, candidate, result)
++}
++
++// candidateApp returns the candidate's app when it belongs to appID, so the
++// dispatch reuses the app loaded for the current request instead of reloading.
++func candidateApp(candidate *app.DeployCandidate, appID types.ID) *app.App {
++	if candidate != nil && candidate.ID == appID {
++		return candidate.App
++	}
++
++	return nil
++}
++
++// resolveRecoveryCandidate rebuilds the stored event and finds the claim's
++// current candidate. A nil candidate with no error means the event no longer
++// matches anything.
++func resolveRecoveryCandidate(ctx context.Context, claimStore *webhookdelivery.Store, result *webhookdelivery.Result) (*TriggerDeployInput, *app.DeployCandidate, error) {
++	delivery, err := claimStore.DeliveryByID(ctx, result.DeliveryID)
++
++	if err != nil {
++		return nil, nil, err
++	}
++
++	if delivery == nil {
++		return nil, nil, errors.New("webhook delivery disappeared for a due claim")
++	}
++
++	input := triggerInputFromDelivery(delivery)
++
++	candidates, err := app.NewStore().DeployCandidates(ctx, input.Repo)
++
++	if err != nil {
++		return nil, nil, err
++	}
++
++	candidate := findCandidate(FilterDeployCandidates(input, candidates), result.AppID, result.EnvID)
++
++	return &input, candidate, nil
++}
++
++// deploymentForClaim loads the deployment linked to a claim, checking the
++// claim column first and the deployment column second to cover the crash
++// window between the insert and the claim update.
++func deploymentForClaim(ctx context.Context, result *webhookdelivery.Result) (*deploy.Deployment, error) {
++	store := deploy.NewStore()
++
++	if result.DeploymentID != 0 {
++		depl, err := store.DeploymentForDispatch(ctx, result.DeploymentID)
++
++		if err != nil {
++			return nil, err
++		}
++
++		if depl != nil {
++			return depl, nil
++		}
++	}
++
++	return store.DeploymentByDeliveryResult(ctx, result.ID)
++}
++
++// findCandidate returns the deploy candidate for a given app/environment pair.
++func findCandidate(candidates []*app.DeployCandidate, appID, envID types.ID) *app.DeployCandidate {
++	for _, candidate := range candidates {
++		if candidate.ID == appID && candidate.EnvID == envID {
++			return candidate
++		}
++	}
++
++	return nil
++}
+diff --git a/src/ce/api/app/apphandlers/handler_inbound_webhooks_delivery_providers_test.go b/src/ce/api/app/apphandlers/handler_inbound_webhooks_delivery_providers_test.go
+new file mode 100644
+index 0000000..4a80387
+--- /dev/null
++++ b/src/ce/api/app/apphandlers/handler_inbound_webhooks_delivery_providers_test.go
+@@ -0,0 +1,105 @@
++package apphandlers_test
++
++import (
++	"encoding/json"
++	"fmt"
++	"net/http"
++
++	"github.com/stormkit-io/stormkit-io/src/ce/api/app/apphandlers"
++	"github.com/stormkit-io/stormkit-io/src/ce/api/app/deploy"
++	"github.com/stormkit-io/stormkit-io/src/lib/shttp"
++	"github.com/stormkit-io/stormkit-io/src/lib/shttp/shttptest"
++	"gopkg.in/guregu/null.v3"
++)
++
++func gitlabRouter() http.Handler {
++	return shttp.NewRouter().RegisterService(apphandlers.Services).Router().Handler()
++}
++
++// Test_Delivery_DuplicateDeploysOnce verifies GitLab deliveries carrying
++// X-Gitlab-Event-UUID are deployed exactly once.
++func (s *InboundGitlabSuite) Test_Delivery_DuplicateDeploysOnce() {
++	appl := s.app(true)
++	payload := s.pushPayload()
++
++	post := func() shttptest.Response {
++		return shttptest.RequestWithHeaders(
++			gitlabRouter(),
++			shttp.MethodPost,
++			fmt.Sprintf("/app/webhooks/gitlab/%s", appl.Secret()),
++			payload,
++			map[string]string{
++				"X-Gitlab-Event":      "Push Hook",
++				"X-Gitlab-Event-UUID": "gitlab-delivery-1",
++			},
++		)
++	}
++
++	s.Equal(http.StatusOK, post().Code)
++	s.Equal(http.StatusOK, post().Code)
++	s.mockDeployer.AssertNumberOfCalls(s.T(), "Deploy", 1)
++}
++
++// Test_Delivery_AlreadyBuiltCommitReturns208 verifies the cross-delivery commit
++// guard stays in effect on the claim path when a delivery UUID is present.
++func (s *InboundGitlabSuite) Test_Delivery_AlreadyBuiltCommitReturns208() {
++	appl := s.app(true)
++
++	s.MockDeployment(s.GetEnv(), map[string]any{
++		"Commit": deploy.CommitInfo{ID: null.NewString("123abc456FGH", true)},
++	})
++
++	payload := map[string]any{}
++	s.Require().NoError(json.Unmarshal([]byte(gitlabMergeExample("opened")), &payload))
++
++	response := shttptest.RequestWithHeaders(
++		gitlabRouter(),
++		shttp.MethodPost,
++		fmt.Sprintf("/app/webhooks/gitlab/%s", appl.Secret()),
++		payload,
++		map[string]string{
++			"X-Gitlab-Event":      "Merge Request Hook",
++			"X-Gitlab-Event-UUID": "gitlab-delivery-2",
++		},
++	)
++
++	s.Equal(http.StatusAlreadyReported, response.Code)
++	s.mockDeployer.AssertNotCalled(s.T(), "Deploy")
++	s.Empty(deliveryResultsFor(s.conn, "gitlab", "gitlab-delivery-2"))
++}
++
++// Test_Delivery_DuplicateDeploysOnce_Bitbucket verifies Bitbucket deliveries
++// carrying X-Request-UUID are deployed exactly once.
++func (s *InboundBitbucketSuite) Test_Delivery_DuplicateDeploysOnce() {
++	appl := s.app(true)
++	payload := s.pushPayload()
++
++	post := func() shttptest.Response {
++		return shttptest.RequestWithHeaders(
++			shttp.NewRouter().RegisterService(apphandlers.Services).Router().Handler(),
++			shttp.MethodPost,
++			fmt.Sprintf("/app/webhooks/bitbucket/%s", appl.Secret()),
++			payload,
++			map[string]string{
++				"X-Event-Key":   bitbucketPushEvent,
++				"X-Request-UUID": "bitbucket-delivery-1",
++			},
++		)
++	}
++
++	s.Equal(http.StatusOK, post().Code)
++	s.Equal(http.StatusOK, post().Code)
++	s.mockDeployer.AssertNumberOfCalls(s.T(), "Deploy", 1)
++}
++
++// Test_Delivery_WithoutIdentityKeepsLegacy verifies a Bitbucket request without
++// X-Request-UUID is unaffected by the claim path (legacy behaviour, no claims).
++func (s *InboundBitbucketSuite) Test_Delivery_WithoutIdentityKeepsLegacy() {
++	appl := s.app(true)
++
++	response := s.post(fmt.Sprintf("/app/webhooks/bitbucket/%s", appl.Secret()), bitbucketPushEvent, s.pushPayload())
++
++	s.Equal(http.StatusOK, response.Code)
++	s.mockDeployer.AssertNumberOfCalls(s.T(), "Deploy", 1)
++	s.Empty(deliveryResultsFor(s.conn, "bitbucket", "bitbucket-delivery-1"))
++}
+diff --git a/src/ce/api/app/apphandlers/handler_inbound_webhooks_delivery_test.go b/src/ce/api/app/apphandlers/handler_inbound_webhooks_delivery_test.go
+new file mode 100644
+index 0000000..f35d162
+--- /dev/null
++++ b/src/ce/api/app/apphandlers/handler_inbound_webhooks_delivery_test.go
+@@ -0,0 +1,403 @@
++package apphandlers_test
++
++import (
++	"context"
++	"encoding/json"
++	"errors"
++	"net/http"
++	"time"
++
++	"github.com/stretchr/testify/mock"
++
++	"github.com/stormkit-io/stormkit-io/src/ce/api/app"
++	"github.com/stormkit-io/stormkit-io/src/ce/api/app/apphandlers"
++	"github.com/stormkit-io/stormkit-io/src/ce/api/app/deploy"
++	"github.com/stormkit-io/stormkit-io/src/ce/api/app/deploy/webhookdelivery"
++	"github.com/stormkit-io/stormkit-io/src/ce/api/app/deployservice"
++	"github.com/stormkit-io/stormkit-io/src/lib/database/databasetest"
++	"github.com/stormkit-io/stormkit-io/src/lib/factory"
++	"github.com/stormkit-io/stormkit-io/src/lib/shttp"
++	"github.com/stormkit-io/stormkit-io/src/lib/shttp/shttptest"
++	"github.com/stormkit-io/stormkit-io/src/mocks"
++)
++
++// deliveryRows are the persisted result rows for one provider delivery.
++type deliveryRow struct {
++	status       string
++	appID        int64
++	envID        int64
++	deploymentID int64
++}
++
++// pushDelivery posts the github push payload with a delivery GUID.
++func (s *InboundGithubSuite) pushDelivery(payload map[string]any, guid string) shttptest.Response {
++	headers := map[string]string{
++		"X-GitHub-Event":      "push",
++		"X-Hub-Signature-256": githubSignature(payload),
++		"X-GitHub-Delivery":   guid,
++	}
++
++	return shttptest.RequestWithHeaders(
++		shttp.NewRouter().RegisterService(apphandlers.Services).Router().Handler(),
++		shttp.MethodPost,
++		"/app/webhooks/github/deploy",
++		payload,
++		headers,
++	)
++}
++
++// deliveryResultsFor returns the persisted result rows of one provider delivery.
++func deliveryResultsFor(conn databasetest.TestDB, provider, guid string) []deliveryRow {
++	rows, err := conn.Query(`
++		SELECT r.status, r.app_id, r.env_id, COALESCE(r.deployment_id, 0)
++		FROM webhook_delivery_results r
++		JOIN webhook_deliveries wd ON wd.delivery_id = r.delivery_id
++		WHERE wd.provider = $1 AND wd.provider_delivery_id = $2
++		ORDER BY r.env_id
++	`, provider, guid)
++	if err != nil {
++		panic(err)
++	}
++
++	defer rows.Close()
++
++	results := []deliveryRow{}
++
++	for rows.Next() {
++		var row deliveryRow
++		if err := rows.Scan(&row.status, &row.appID, &row.envID, &row.deploymentID); err != nil {
++			panic(err)
++		}
++
++		results = append(results, row)
++	}
++
++	return results
++}
++
++// deliveryResults returns the persisted result rows for the current test.
++func (s *InboundGithubSuite) deliveryResults(provider, guid string) []deliveryRow {
++	return deliveryResultsFor(s.conn, provider, guid)
++}
++
++// pushExamplePayload unmarshals the simple push example used by the delivery
++// tests.
++func (s *InboundGithubSuite) pushExamplePayload() map[string]any {
++	payload := map[string]any{}
++	s.Require().NoError(json.Unmarshal([]byte(githubPushExample), &payload))
++
++	return payload
++}
++
++// staleClaim ages a processing claim so its lease has expired.
++func (s *InboundGithubSuite) staleClaim(resultID int64) {
++	_, err := s.conn.Exec(`
++		UPDATE webhook_delivery_results
++		SET claimed_at = NOW() AT TIME ZONE 'UTC' - INTERVAL '10 minutes'
++		WHERE result_id = $1
++	`, resultID)
++	s.Require().NoError(err)
++}
++
++// Test_Delivery_DuplicateRequestDeploysOnce verifies two identical deliveries
++// (provider retry or redelivery) start a single deployment and both answer 200.
++func (s *InboundGithubSuite) Test_Delivery_DuplicateRequestDeploysOnce() {
++	appl := s.app(nil)
++	payload := s.pushExamplePayload()
++
++	first := s.pushDelivery(payload, "github-delivery-1")
++	s.Equal(http.StatusOK, first.Code)
++
++	second := s.pushDelivery(payload, "github-delivery-1")
++	s.Equal(http.StatusOK, second.Code)
++
++	s.mockDeployer.AssertNumberOfCalls(s.T(), "Deploy", 1)
++	s.mockDeployer.AssertCalled(s.T(), "Deploy",
++		mock.Anything,
++		mock.MatchedBy(func(a *app.App) bool { return a.ID == appl.ID }),
++		mock.MatchedBy(func(d *deploy.Deployment) bool { return d.DeliveryResultID != 0 }),
++	)
++
++	results := s.deliveryResults(webhookdelivery.ProviderGitHub, "github-delivery-1")
++	s.Len(results, 1)
++	s.Equal("succeeded", results[0].status)
++	s.Equal(int64(appl.ID), results[0].appID)
++}
++
++// Test_Delivery_ConcurrentRequestAccepted verifies that a second request while
++// the first is still processing gets 202 and starts nothing.
++func (s *InboundGithubSuite) Test_Delivery_ConcurrentRequestAccepted() {
++	appl := s.app(nil)
++	env := s.GetEnv()
++
++	deliveryID, err := webhookdelivery.NewStore().UpsertDelivery(context.Background(), &webhookdelivery.Delivery{
++		Provider:         webhookdelivery.ProviderGitHub,
++		ProviderDelivery: "github-delivery-2",
++		Repo:             "github/stormkit-test-acc/test-repo",
++		Branch:           "main",
++	})
++	s.Require().NoError(err)
++
++	_, _, err = webhookdelivery.NewStore().ClaimResult(context.Background(), deliveryID, appl.ID, env.ID, "production")
++	s.Require().NoError(err)
++
++	response := s.pushDelivery(s.pushExamplePayload(), "github-delivery-2")
++	s.Equal(http.StatusAccepted, response.Code)
++	s.mockDeployer.AssertNotCalled(s.T(), "Deploy")
++
++	results := s.deliveryResults(webhookdelivery.ProviderGitHub, "github-delivery-2")
++	s.Len(results, 1)
++	s.Equal("processing", results[0].status)
++}
++
++// Test_Delivery_MultipleEnvironmentsFanOut verifies one delivery matching two
++// environments deploys and records both, never merging them into one result.
++func (s *InboundGithubSuite) Test_Delivery_MultipleEnvironmentsFanOut() {
++	appl := s.app(nil)
++	firstEnv := s.GetEnv()
++	secondEnv := s.MockEnv(appl, map[string]any{"Name": "staging", "Branch": "main"})
++
++	response := s.pushDelivery(s.pushExamplePayload(), "github-delivery-3")
++	s.Equal(http.StatusOK, response.Code)
++
++	s.mockDeployer.AssertNumberOfCalls(s.T(), "Deploy", 2)
++
++	envIDs := map[int64]bool{}
++
++	for _, call := range s.mockDeployer.Calls {
++		d := call.Arguments.Get(2).(*deploy.Deployment)
++		envIDs[int64(d.EnvID)] = true
++	}
++
++	s.True(envIDs[int64(firstEnv.ID)])
++	s.True(envIDs[int64(secondEnv.ID)])
++
++	results := s.deliveryResults(webhookdelivery.ProviderGitHub, "github-delivery-3")
++	s.Len(results, 2)
++
++	for _, row := range results {
++		s.Equal("succeeded", row.status)
++		s.Equal(int64(appl.ID), row.appID)
++	}
++}
++
++// Test_Delivery_DeployFailureThenRedelivery verifies a failed start stays
++// retryable and the redelivery resumes successfully, with one success attempt.
++func (s *InboundGithubSuite) Test_Delivery_DeployFailureThenRedelivery() {
++	s.app(nil)
++
++	failing := &mocks.Deployer{}
++	failing.On("Deploy", mock.Anything, mock.Anything, mock.Anything).Return(errors.New("queue is down"))
++	deployservice.MockDeployer = failing
++
++	first := s.pushDelivery(s.pushExamplePayload(), "github-delivery-4")
++	s.Equal(http.StatusServiceUnavailable, first.Code)
++	failing.AssertNumberOfCalls(s.T(), "Deploy", 1)
++
++	results := s.deliveryResults(webhookdelivery.ProviderGitHub, "github-delivery-4")
++	s.Len(results, 1)
++	s.Equal("retryable", results[0].status)
++
++	// Redelivery: restore the healthy deployer and resend the same GUID.
++	deployservice.MockDeployer = s.mockDeployer
++
++	second := s.pushDelivery(s.pushExamplePayload(), "github-delivery-4")
++	s.Equal(http.StatusOK, second.Code)
++	s.mockDeployer.AssertNumberOfCalls(s.T(), "Deploy", 1)
++
++	results = s.deliveryResults(webhookdelivery.ProviderGitHub, "github-delivery-4")
++	s.Len(results, 1)
++	s.Equal("succeeded", results[0].status)
++}
++
++// Test_Delivery_NoCandidates verifies events that match nothing stay 204 and
++// leave only the inbox row, without result claims.
++func (s *InboundGithubSuite) Test_Delivery_NoCandidates() {
++	response := s.pushDelivery(s.pushExamplePayload(), "github-delivery-5")
++	s.Equal(http.StatusNoContent, response.Code)
++	s.mockDeployer.AssertNotCalled(s.T(), "Deploy")
++	s.Empty(s.deliveryResults(webhookdelivery.ProviderGitHub, "github-delivery-5"))
++}
++
++// Test_RecoverStaleClaim_DispatchesExistingDeployment covers the crash window
++// where the deployment exists but the queue dispatch may not have happened:
++// recovery only dispatches, never inserts again.
++func (s *InboundGithubSuite) Test_RecoverStaleClaim_DispatchesExistingDeployment() {
++	appl := s.app(nil)
++	env := s.GetEnv()
++	depl := s.MockDeployment(env, nil)
++
++	deliveryID, err := webhookdelivery.NewStore().UpsertDelivery(context.Background(), &webhookdelivery.Delivery{
++		Provider:         webhookdelivery.ProviderGitHub,
++		ProviderDelivery: "github-delivery-7",
++		Repo:             appl.Repo,
++		Branch:           "main",
++	})
++	s.Require().NoError(err)
++
++	result, _, err := webhookdelivery.NewStore().ClaimResult(context.Background(), deliveryID, appl.ID, env.ID, "production")
++	s.Require().NoError(err)
++
++	_, err = s.conn.Exec(`UPDATE webhook_delivery_results SET deployment_id = $2 WHERE result_id = $1`, result.ID, depl.ID)
++	s.Require().NoError(err)
++
++	s.staleClaim(int64(result.ID))
++
++	s.mockDeployer.On("Dispatch", mock.Anything, mock.Anything, mock.Anything).Return(nil).Once()
++
++	s.Require().NoError(apphandlers.RecoverPendingWebhookDeliveries(context.Background()))
++
++	s.mockDeployer.AssertNotCalled(s.T(), "Deploy")
++	s.mockDeployer.AssertNumberOfCalls(s.T(), "Dispatch", 1)
++
++	results := s.deliveryResults(webhookdelivery.ProviderGitHub, "github-delivery-7")
++	s.Len(results, 1)
++	s.Equal("succeeded", results[0].status)
++	s.Equal(int64(depl.ID), results[0].deploymentID)
++
++	// A redelivery after recovery is a stable 200 with no further dispatch.
++	response := s.pushDelivery(s.pushExamplePayload(), "github-delivery-7")
++	s.Equal(http.StatusOK, response.Code)
++	s.mockDeployer.AssertNumberOfCalls(s.T(), "Dispatch", 1)
++}
++
++// Test_Delivery_RedeliveryWithDeploymentDispatchesOnly verifies the HTTP
++// redelivery of a claim whose deployment was already inserted (enqueue failed
++// before the crash) does not insert again: it re-dispatches the existing
++// deployment and answers 200.
++func (s *InboundGithubSuite) Test_Delivery_RedeliveryWithDeploymentDispatchesOnly() {
++	appl := s.app(nil)
++	env := s.GetEnv()
++	depl := s.MockDeployment(env, nil)
++
++	store := webhookdelivery.NewStore()
++	ctx := context.Background()
++
++	deliveryID, err := store.UpsertDelivery(ctx, &webhookdelivery.Delivery{
++		Provider:         webhookdelivery.ProviderGitHub,
++		ProviderDelivery: "github-delivery-10",
++		Repo:             appl.Repo,
++		Branch:           "main",
++	})
++	s.Require().NoError(err)
++
++	result, _, err := store.ClaimResult(ctx, deliveryID, appl.ID, env.ID, "production")
++	s.Require().NoError(err)
++
++	// Simulate "insert succeeded, enqueue failed": the deployment exists and is
++	// linked to the retryable claim with an elapsed backoff.
++	past := time.Now().Add(-time.Minute)
++	s.Require().NoError(store.MarkRetryable(ctx, result.ID, depl.ID, "queue down", &past))
++
++	s.mockDeployer.On("Dispatch", mock.Anything, mock.Anything, mock.Anything).Return(nil).Once()
++
++	response := s.pushDelivery(s.pushExamplePayload(), "github-delivery-10")
++	s.Equal(http.StatusOK, response.Code)
++	s.mockDeployer.AssertNotCalled(s.T(), "Deploy")
++	s.mockDeployer.AssertNumberOfCalls(s.T(), "Dispatch", 1)
++
++	results := s.deliveryResults(webhookdelivery.ProviderGitHub, "github-delivery-10")
++	s.Len(results, 1)
++	s.Equal("succeeded", results[0].status)
++	s.Equal(int64(depl.ID), results[0].deploymentID)
++}
++
++// Test_RecoverStaleClaim_CreatesMissingDeployment covers the crash window where
++// nothing was inserted: recovery replays the stored event for the claim.
++func (s *InboundGithubSuite) Test_RecoverStaleClaim_CreatesMissingDeployment() {
++	appl := s.app(nil)
++	env := s.GetEnv()
++
++	deliveryID, err := webhookdelivery.NewStore().UpsertDelivery(context.Background(), &webhookdelivery.Delivery{
++		Provider:         webhookdelivery.ProviderGitHub,
++		ProviderDelivery: "github-delivery-8",
++		Repo:             appl.Repo,
++		CheckoutRepo:     appl.Repo,
++		Branch:           "main",
++		EventType:        "commit",
++		ChangesComplete:  true,
++		Payload:          []byte(`{"ref":"refs/heads/main"}`),
++	})
++	s.Require().NoError(err)
++
++	result, _, err := webhookdelivery.NewStore().ClaimResult(context.Background(), deliveryID, appl.ID, env.ID, "production")
++	s.Require().NoError(err)
++	s.staleClaim(int64(result.ID))
++
++	s.Require().NoError(apphandlers.RecoverPendingWebhookDeliveries(context.Background()))
++
++	s.mockDeployer.AssertNumberOfCalls(s.T(), "Deploy", 1)
++	s.mockDeployer.AssertCalled(s.T(), "Deploy",
++		mock.Anything, mock.Anything,
++		mock.MatchedBy(func(d *deploy.Deployment) bool { return d.DeliveryResultID == result.ID }),
++	)
++
++	results := s.deliveryResults(webhookdelivery.ProviderGitHub, "github-delivery-8")
++	s.Len(results, 1)
++	s.Equal("succeeded", results[0].status)
++}
++
++// Test_Recover_SkipsFreshSucceededAndFutureRetry verifies the recovery job only
++// touches expired processing and due retryable claims.
++func (s *InboundGithubSuite) Test_Recover_SkipsFreshSucceededAndFutureRetry() {
++	mkAppWithEnv := func() (*factory.MockApp, *factory.MockEnv) {
++		appl := s.MockApp(nil, nil)
++		env := s.MockEnv(appl, nil)
++
++		return appl, env
++	}
++
++	appl, env := mkAppWithEnv()
++	s.MockDeployment(env, nil)
++
++	store := webhookdelivery.NewStore()
++	ctx := context.Background()
++
++	deliveryID, err := store.UpsertDelivery(ctx, &webhookdelivery.Delivery{
++		Provider:         webhookdelivery.ProviderGitHub,
++		ProviderDelivery: "github-delivery-9",
++		Repo:             appl.Repo,
++		Branch:           "main",
++	})
++	s.Require().NoError(err)
++
++	// Fresh processing: must stay processing.
++	fresh, _, err := store.ClaimResult(ctx, deliveryID, appl.ID, env.ID, "production")
++	s.Require().NoError(err)
++
++	// Succeeded claim with a deployment: must stay succeeded.
++	secondApp, secondEnv := mkAppWithEnv()
++	succeededDepl := s.MockDeployment(secondEnv, nil)
++
++	succeeded, _, err := store.ClaimResult(ctx, deliveryID, secondApp.ID, secondEnv.ID, "production")
++	s.Require().NoError(err)
++	s.Require().NoError(store.MarkSucceeded(ctx, succeeded.ID, succeededDepl.ID))
++
++	// Retryable claim with a future backoff and an existing deployment: left alone.
++	thirdApp, thirdEnv := mkAppWithEnv()
++	retryDepl := s.MockDeployment(thirdEnv, nil)
++
++	future := time.Now().Add(time.Hour)
++
++	retry, _, err := store.ClaimResult(ctx, deliveryID, thirdApp.ID, thirdEnv.ID, "production")
++	s.Require().NoError(err)
++	s.Require().NoError(store.MarkRetryable(ctx, retry.ID, retryDepl.ID, "queue down", &future))
++
++	s.Require().NoError(apphandlers.RecoverPendingWebhookDeliveries(ctx))
++
++	s.mockDeployer.AssertNotCalled(s.T(), "Deploy")
++	s.mockDeployer.AssertNotCalled(s.T(), "Dispatch")
++
++	r, err := store.ResultByKey(ctx, deliveryID, appl.ID, env.ID)
++	s.Require().NoError(err)
++	s.Equal("processing", r.Status)
++	s.Equal(fresh.ID, r.ID)
++
++	r, err = store.ResultByKey(ctx, deliveryID, secondApp.ID, secondEnv.ID)
++	s.Require().NoError(err)
++	s.Equal("succeeded", r.Status)
++
++	r, err = store.ResultByKey(ctx, deliveryID, thirdApp.ID, thirdEnv.ID)
++	s.Require().NoError(err)
++	s.Equal("retryable", r.Status)
++}
+diff --git a/src/ce/api/app/apphandlers/handler_inbound_webhooks_github.go b/src/ce/api/app/apphandlers/handler_inbound_webhooks_github.go
+index be41239..09cffb7 100644
+--- a/src/ce/api/app/apphandlers/handler_inbound_webhooks_github.go
++++ b/src/ce/api/app/apphandlers/handler_inbound_webhooks_github.go
+@@ -11,6 +11,7 @@ import (
+ 	"strings"
+ 
+ 	"github.com/stormkit-io/stormkit-io/src/ce/api/admin"
++	"github.com/stormkit-io/stormkit-io/src/ce/api/app/deploy/webhookdelivery"
+ 	"github.com/stormkit-io/stormkit-io/src/lib/shttp"
+ 	"github.com/stormkit-io/stormkit-io/src/lib/slog"
+ 	"github.com/stormkit-io/stormkit-io/src/lib/utils"
+@@ -33,26 +34,47 @@ const githubMaxPayloadSize = 25 << 20
+ // configured, since the payload cannot be verified without one.
+ var ErrGithubWebhookSecretMissing = errors.New("github webhook secret is not configured")
+ 
++// readAndRestoreBody reads the verified request body and restores it for the
++// provider parser, returning the exact bytes that were signed.
++func readAndRestoreBody(req *shttp.RequestContext) ([]byte, error) {
++	body, err := io.ReadAll(req.Body)
++
++	if err != nil {
++		return nil, err
++	}
++
++	req.Body = io.NopCloser(bytes.NewReader(body))
++
++	return body, nil
++}
++
++// deliveryHeader trims the provider delivery identity. An empty (or
++// whitespace-only) header is treated as a missing identity.
++func deliveryHeader(value string) string {
++	return strings.TrimSpace(value)
++}
++
+ // github verifies the X-Hub-Signature-256 header against the configured
+-// webhook secret and restores the request body for parsing.
+-func (v webhookVerifier) github() error {
++// webhook secret and restores the request body for parsing. It returns the
++// verified body so callers persist the exact bytes that were signed.
++func (v webhookVerifier) github() ([]byte, error) {
+ 	secret := admin.MustConfig().GithubWebhookSecret()
+ 
+ 	if secret == "" {
+-		return ErrGithubWebhookSecretMissing
++		return nil, ErrGithubWebhookSecretMissing
+ 	}
+ 
+ 	signature := v.req.Header.Get("X-Hub-Signature-256")
+ 
+ 	// Unsigned requests are rejected before their body is read.
+ 	if !strings.HasPrefix(signature, "sha256=") {
+-		return ErrInvalidWebhookSecret
++		return nil, ErrInvalidWebhookSecret
+ 	}
+ 
+ 	body, err := io.ReadAll(io.LimitReader(v.req.Body, githubMaxPayloadSize))
+ 
+ 	if err != nil {
+-		return err
++		return nil, err
+ 	}
+ 
+ 	v.req.Body = io.NopCloser(bytes.NewReader(body))
+@@ -63,15 +85,17 @@ func (v webhookVerifier) github() error {
+ 	expected := "sha256=" + hex.EncodeToString(mac.Sum(nil))
+ 
+ 	if !hmac.Equal([]byte(signature), []byte(expected)) {
+-		return ErrInvalidWebhookSecret
++		return nil, ErrInvalidWebhookSecret
+ 	}
+ 
+-	return nil
++	return body, nil
+ }
+ 
+ // processGithubPayload processes a github payload and starts a new deployment.
+ func processGithubPayload(req *shttp.RequestContext) (*TriggerDeployInput, error) {
+-	if err := (webhookVerifier{req: req}).github(); err != nil {
++	body, err := (webhookVerifier{req: req}).github()
++
++	if err != nil {
+ 		slog.Infof("github webhook rejected: %s", err.Error())
+ 		return nil, err
+ 	}
+@@ -100,7 +124,10 @@ func processGithubPayload(req *shttp.RequestContext) (*TriggerDeployInput, error
+ 	}
+ 
+ 	input := TriggerDeployInput{
+-		payload: payload,
++		Provider:   webhookdelivery.ProviderGitHub,
++		deliveryID: deliveryHeader(req.Header.Get("X-GitHub-Delivery")),
++		payloadRaw: body,
++		payload:    payload,
+ 	}
+ 
+ 	switch event := payload.(type) {
+diff --git a/src/ce/api/app/apphandlers/handler_inbound_webhooks_gitlab.go b/src/ce/api/app/apphandlers/handler_inbound_webhooks_gitlab.go
+index f0f5546..f706d81 100644
+--- a/src/ce/api/app/apphandlers/handler_inbound_webhooks_gitlab.go
++++ b/src/ce/api/app/apphandlers/handler_inbound_webhooks_gitlab.go
+@@ -5,6 +5,7 @@ import (
+ 	"fmt"
+ 	"strings"
+ 
++	"github.com/stormkit-io/stormkit-io/src/ce/api/app/deploy/webhookdelivery"
+ 	"github.com/stormkit-io/stormkit-io/src/lib/shttp"
+ 	"github.com/stormkit-io/stormkit-io/src/lib/slog"
+ 	"gopkg.in/go-playground/webhooks.v5/gitlab"
+@@ -13,6 +14,15 @@ import (
+ const VisibilityLevelPublic = 20
+ 
+ func processGitlabPayload(req *shttp.RequestContext) (*TriggerDeployInput, error) {
++	// The per-app secret was verified before this parser runs, so the body is
++	// only read now. Capture it for the delivery inbox and restore it for the
++	// provider parser.
++	body, err := readAndRestoreBody(req)
++
++	if err != nil {
++		return nil, err
++	}
++
+ 	hook, _ := gitlab.New()
+ 	payload, err := hook.Parse(
+ 		req.Request,
+@@ -33,7 +43,10 @@ func processGitlabPayload(req *shttp.RequestContext) (*TriggerDeployInput, error
+ 	}
+ 
+ 	input := TriggerDeployInput{
+-		payload: payload,
++		Provider:   webhookdelivery.ProviderGitLab,
++		deliveryID: deliveryHeader(req.Header.Get("X-Gitlab-Event-UUID")),
++		payloadRaw: body,
++		payload:    payload,
+ 	}
+ 
+ 	switch event := payload.(type) {
+diff --git a/src/ce/api/app/apphandlers/handler_inbound_webhooks_internal_test.go b/src/ce/api/app/apphandlers/handler_inbound_webhooks_internal_test.go
+new file mode 100644
+index 0000000..5a705c9
+--- /dev/null
++++ b/src/ce/api/app/apphandlers/handler_inbound_webhooks_internal_test.go
+@@ -0,0 +1,122 @@
++package apphandlers
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"strings"
++	"testing"
++
++	"github.com/stormkit-io/stormkit-io/src/ce/api/app/deploy/webhookdelivery"
++	"github.com/stormkit-io/stormkit-io/src/lib/shttp"
++)
++
++func newWebhookRequest(t *testing.T, eventHeader string, body string) *shttp.RequestContext {
++	t.Helper()
++
++	req := httptest.NewRequest(http.MethodPost, "/app/webhooks/gitlab", strings.NewReader(body))
++
++	if eventHeader != "" {
++		req.Header.Set("Content-Type", "application/json")
++	}
++
++	return shttp.NewRequestContext(req)
++}
++
++// Test_ProcessGitlabPayload_DeliveryIdentity verifies the GitLab event UUID is
++// captured together with the exact request body, and a missing header means no
++// delivery identity (legacy path).
++func Test_ProcessGitlabPayload_DeliveryIdentity(t *testing.T) {
++	const push = `{
++		"object_kind": "push",
++		"ref": "refs/heads/main",
++		"project": {"path_with_namespace": "stormkit-test-acc/test-repo", "default_branch": "main"},
++		"commits": [{"message": "Update something"}]
++	}`
++
++	t.Run("with event uuid", func(t *testing.T) {
++		req := newWebhookRequest(t, "", push)
++		req.Header.Set("X-Gitlab-Event", "Push Hook")
++		req.Header.Set("X-Gitlab-Event-UUID", "  gitlab-guid-123  ")
++
++		input, err := processGitlabPayload(req)
++		if err != nil {
++			t.Fatalf("unexpected error: %v", err)
++		}
++
++		if input.Provider != webhookdelivery.ProviderGitLab {
++			t.Fatalf("expected provider gitlab, got %q", input.Provider)
++		}
++
++		if input.deliveryID != "gitlab-guid-123" {
++			t.Fatalf("expected trimmed delivery id, got %q", input.deliveryID)
++		}
++
++		if string(input.payloadRaw) != push {
++			t.Fatal("payloadRaw must be the exact verified request body")
++		}
++	})
++
++	t.Run("without event uuid", func(t *testing.T) {
++		req := newWebhookRequest(t, "", push)
++		req.Header.Set("X-Gitlab-Event", "Push Hook")
++
++		input, err := processGitlabPayload(req)
++		if err != nil {
++			t.Fatalf("unexpected error: %v", err)
++		}
++
++		if input.deliveryID != "" {
++			t.Fatalf("expected empty delivery id, got %q", input.deliveryID)
++		}
++
++		if string(input.payloadRaw) != push {
++			t.Fatal("payloadRaw must be captured even without a delivery id")
++		}
++	})
++}
++
++// Test_ProcessBitbucketPayload_DeliveryIdentity verifies the Bitbucket request
++// UUID is captured as the delivery identity.
++func Test_ProcessBitbucketPayload_DeliveryIdentity(t *testing.T) {
++	const push = `{
++		"repository": {"full_name": "stormkit-test/test-repo"},
++		"push": {"changes": [{"new": {"type": "branch", "name": "main", "target": {"type": "commit", "message": "msg"}}}]}
++	}`
++
++	t.Run("with request uuid", func(t *testing.T) {
++		req := newWebhookRequest(t, "", push)
++		req.Header.Set("X-Event-Key", "repo:push")
++		req.Header.Set("X-Request-UUID", "bitbucket-guid-456")
++
++		input, err := processBitbucketPayload(req)
++		if err != nil {
++			t.Fatalf("unexpected error: %v", err)
++		}
++
++		if input.Provider != webhookdelivery.ProviderBitbucket {
++			t.Fatalf("expected provider bitbucket, got %q", input.Provider)
++		}
++
++		if input.deliveryID != "bitbucket-guid-456" {
++			t.Fatalf("expected delivery id bitbucket-guid-456, got %q", input.deliveryID)
++		}
++
++		if string(input.payloadRaw) != push {
++			t.Fatal("payloadRaw must be the exact request body")
++		}
++	})
++
++	t.Run("without request uuid", func(t *testing.T) {
++		req := newWebhookRequest(t, "", push)
++		req.Header.Set("X-Event-Key", "repo:push")
++
++		input, err := processBitbucketPayload(req)
++		if err != nil {
++			t.Fatalf("unexpected error: %v", err)
++		}
++
++		if input.deliveryID != "" {
++			t.Fatalf("expected empty delivery id, got %q", input.deliveryID)
++		}
++	})
++}
+diff --git a/src/ce/api/app/deploy/deployment_dispatch_store_test.go b/src/ce/api/app/deploy/deployment_dispatch_store_test.go
+new file mode 100644
+index 0000000..827ab65
+--- /dev/null
++++ b/src/ce/api/app/deploy/deployment_dispatch_store_test.go
+@@ -0,0 +1,194 @@
++package deploy_test
++
++import (
++	"context"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/suite"
++
++	"github.com/stormkit-io/stormkit-io/src/ce/api/app/deploy"
++	"github.com/stormkit-io/stormkit-io/src/ce/api/app/deploy/webhookdelivery"
++	"github.com/stormkit-io/stormkit-io/src/lib/database"
++	"github.com/stormkit-io/stormkit-io/src/lib/database/databasetest"
++	"github.com/stormkit-io/stormkit-io/src/lib/factory"
++	"github.com/stormkit-io/stormkit-io/src/lib/types"
++)
++
++type DeploymentDispatchSuite struct {
++	suite.Suite
++	*factory.Factory
++	conn databasetest.TestDB
++}
++
++func (s *DeploymentDispatchSuite) BeforeTest(suiteName, _ string) {
++	s.conn = databasetest.InitTx(suiteName)
++	s.Factory = factory.New(s.conn)
++}
++
++func (s *DeploymentDispatchSuite) AfterTest(_, _ string) {
++	s.conn.CloseTx()
++}
++
++// claim creates a delivery with one result row and returns the result id.
++func (s *DeploymentDispatchSuite) claim(appID, envID types.ID) types.ID {
++	deliveryID, err := webhookdelivery.NewStore().UpsertDelivery(context.Background(), &webhookdelivery.Delivery{
++		Provider:         webhookdelivery.ProviderGitHub,
++		ProviderDelivery: "dispatch-delivery",
++		Repo:             "github/stormkit-test-acc/test-repo",
++	})
++	s.Require().NoError(err)
++
++	result, _, err := webhookdelivery.NewStore().ClaimResult(context.Background(), deliveryID, appID, envID, "production")
++	s.Require().NoError(err)
++
++	return result.ID
++}
++
++// Test_InsertDeployment_DeliveryResultUnique verifies the partial unique index
++// enforces a single deployment per delivery claim at the database level.
++func (s *DeploymentDispatchSuite) Test_InsertDeployment_DeliveryResultUnique() {
++	a := assert.New(s.T())
++	appl := s.MockApp(nil, nil)
++	env := s.MockEnv(appl, nil)
++
++	resultID := s.claim(appl.ID, env.ID)
++
++	first := deploy.New(appl.App)
++	first.EnvID = env.ID
++	first.Env = env.Name
++	first.Branch = "main"
++	first.CheckoutRepo = appl.Repo
++	first.IsAutoDeploy = true
++	first.DeliveryResultID = resultID
++
++	a.NoError(deploy.NewStore().InsertDeployment(context.Background(), first))
++
++	second := deploy.New(appl.App)
++	second.EnvID = env.ID
++	second.Env = env.Name
++	second.Branch = "main"
++	second.CheckoutRepo = appl.Repo
++	second.IsAutoDeploy = true
++	second.DeliveryResultID = resultID
++
++	err := deploy.NewStore().InsertDeployment(context.Background(), second)
++	a.Error(err)
++	a.True(database.IsDuplicate(err))
++}
++
++// Test_InsertDeployment_SoftDeletedFreesClaim verifies the partial unique
++// index ignores soft-deleted deployments, so a claim may deploy again after a
++// deployment was deleted.
++func (s *DeploymentDispatchSuite) Test_InsertDeployment_SoftDeletedFreesClaim() {
++	appl := s.MockApp(nil, nil)
++	env := s.MockEnv(appl, nil)
++
++	resultID := s.claim(appl.ID, env.ID)
++
++	first := deploy.New(appl.App)
++	first.EnvID = env.ID
++	first.Env = env.Name
++	first.Branch = "main"
++	first.CheckoutRepo = appl.Repo
++	first.IsAutoDeploy = true
++	first.DeliveryResultID = resultID
++	s.Require().NoError(deploy.NewStore().InsertDeployment(context.Background(), first))
++
++	_, err := s.conn.Exec(`
++		UPDATE deployments SET deleted_at = NOW() AT TIME ZONE 'UTC'
++		WHERE deployment_id = $1
++	`, first.ID)
++	s.Require().NoError(err)
++
++	second := deploy.New(appl.App)
++	second.EnvID = env.ID
++	second.Env = env.Name
++	second.Branch = "main"
++	second.CheckoutRepo = appl.Repo
++	second.IsAutoDeploy = true
++	second.DeliveryResultID = resultID
++
++	s.Require().NoError(deploy.NewStore().InsertDeployment(context.Background(), second))
++	s.NotEqual(first.ID, second.ID)
++}
++
++// Test_InsertDeployment_WithoutClaim verifies that deployments not tied to a
++// webhook claim keep a null delivery result (manual deploys, factories).
++func (s *DeploymentDispatchSuite) Test_InsertDeployment_WithoutClaim() {
++	appl := s.MockApp(nil, nil)
++	env := s.MockEnv(appl, nil)
++	d := s.MockDeployment(env, nil)
++
++	var deliveryResultID any
++	err := s.conn.QueryRow(`
++		SELECT delivery_result_id FROM deployments WHERE deployment_id = $1
++	`, d.ID).Scan(&deliveryResultID)
++
++	s.Require().NoError(err)
++	s.Nil(deliveryResultID)
++}
++
++// Test_DeploymentForDispatch restores every field the queue message needs,
++// including the build config frozen in the config snapshot.
++func (s *DeploymentDispatchSuite) Test_DeploymentForDispatch() {
++	appl := s.MockApp(nil, nil)
++	env := s.MockEnv(appl, nil)
++	d := s.MockDeployment(env, map[string]any{
++		"Branch":        "release/x",
++		"ShouldPublish": true,
++	})
++
++	// is_priority is not part of the factory insert; set it directly.
++	_, err := s.conn.Exec(`UPDATE deployments SET is_priority = TRUE WHERE deployment_id = $1`, d.ID)
++	s.Require().NoError(err)
++
++	loaded, err := deploy.NewStore().DeploymentForDispatch(context.Background(), d.ID)
++	s.Require().NoError(err)
++	s.Require().NotNil(loaded)
++
++	s.Equal(d.ID, loaded.ID)
++	s.Equal(appl.ID, loaded.AppID)
++	s.Equal(env.ID, loaded.EnvID)
++	s.Equal(env.Name, loaded.Env)
++	s.Equal("release/x", loaded.Branch)
++	s.True(loaded.IsPriority)
++	s.True(loaded.ShouldPublish)
++	s.Require().NotNil(loaded.BuildConfig)
++	s.Equal("npm run build", loaded.BuildConfig.BuildCmd)
++
++	missing, err := deploy.NewStore().DeploymentForDispatch(context.Background(), types.ID(999999))
++	s.Require().NoError(err)
++	s.Nil(missing)
++}
++
++// Test_DeploymentByDeliveryResult finds the deployment through its claim, which
++// is how crash recovery detects that an insert already happened.
++func (s *DeploymentDispatchSuite) Test_DeploymentByDeliveryResult() {
++	appl := s.MockApp(nil, nil)
++	env := s.MockEnv(appl, nil)
++	d := s.MockDeployment(env, nil)
++
++	resultID := s.claim(appl.ID, env.ID)
++
++	// The factory insert predates the claim, so the link is established here,
++	// mirroring what happened when InsertDeployment carried the claim id.
++	_, err := s.conn.Exec(`
++		UPDATE deployments SET delivery_result_id = $1 WHERE deployment_id = $2
++	`, resultID, d.ID)
++	s.Require().NoError(err)
++
++	loaded, err := deploy.NewStore().DeploymentByDeliveryResult(context.Background(), resultID)
++	s.Require().NoError(err)
++	s.Require().NotNil(loaded)
++	s.Equal(d.ID, loaded.ID)
++	s.Equal(appl.ID, loaded.AppID)
++
++	missing, err := deploy.NewStore().DeploymentByDeliveryResult(context.Background(), resultID+99999)
++	s.Require().NoError(err)
++	s.Nil(missing)
++}
++
++func TestDeploymentDispatchSuite(t *testing.T) {
++	suite.Run(t, new(DeploymentDispatchSuite))
++}
+diff --git a/src/ce/api/app/deploy/deployment_model.go b/src/ce/api/app/deploy/deployment_model.go
+index 1edeaa8..02ad5f2 100644
+--- a/src/ce/api/app/deploy/deployment_model.go
++++ b/src/ce/api/app/deploy/deployment_model.go
+@@ -96,6 +96,12 @@ type Deployment struct {
+ 	APIPathPrefix      null.String    `json:"apiPathPrefix,omitempty"`
+ 	WebhookEvent       any            `json:"-"` // The webhook event that triggers the deployment
+ 	MigrationsFolder   null.String    `json:"migrationsFolder,omitempty"`
++
++	// DeliveryResultID links an auto deployment back to the webhook delivery
++	// result that claimed it. It is the database-side guarantee that one claim
++	// never creates two deployments. Zero means the deployment was started
++	// manually or through another path.
++	DeliveryResultID types.ID `json:"-"`
+ 	UploadResult       *UploadResult  `json:"uploadResult,omitempty"`
+ 	IsPriority         bool           `json:"isPriority,omitempty"`
+ 
+diff --git a/src/ce/api/app/deploy/deployment_statements.go b/src/ce/api/app/deploy/deployment_statements.go
+index 6cc6c41..3324a22 100644
+--- a/src/ce/api/app/deploy/deployment_statements.go
++++ b/src/ce/api/app/deploy/deployment_statements.go
+@@ -8,11 +8,22 @@ var (
+ 	tableDeploys = "deployments"
+ )
+ 
++// deploymentDispatchColumns lists the fields required to rebuild a build-queue
++// message for a deployment that was persisted by an earlier attempt.
++const deploymentDispatchColumns = `
++	deployment_id, app_id, COALESCE(env_id, 0), COALESCE(env_name, ''),
++	COALESCE(branch, ''), COALESCE(checkout_repo, ''),
++	pull_request_number, COALESCE(auto_publish, false),
++	COALESCE(is_priority, false), migrations_folder, config_snapshot
++`
++
+ type statement struct {
+ 	selectDeploymentsV2      string
+-	selectBuildManifest      string
+-	selectDeploymentStatus   string
+-	insertDeployment         string
++	selectBuildManifest             string
++	selectDeploymentStatus          string
++	selectDeploymentForDispatch     string
++	selectDeploymentByDeliveryClaim string
++	insertDeployment                string
+ 	restartDeployment        string
+ 	updateExitCode           string
+ 	updateCommitInfo         string
+@@ -78,20 +89,39 @@ var stmt = &statement{
+ 			is_auto_deploy, pull_request_number,
+ 			commit_id, is_fork, auto_publish, checkout_repo,
+ 			api_path_prefix, webhook_event, commit_author, migrations_folder,
+-			is_priority
++			is_priority, delivery_result_id
+ 		)
+ 		VALUES (
+ 			$1, $2, $3, $4, $5,
+ 			$6, $7,
+ 			$8, $9, $10, $11,
+ 			$12, $13, $14, $15,
+-			$16
++			$16, $17
+ 		)
+ 		RETURNING
+ 			deployment_id,
+ 			created_at;
+ 	`,
+ 
++	// selectDeploymentForDispatch loads only the fields required to rebuild
++	// the build-queue message of a deployment that already exists, so crash
++	// recovery can re-dispatch it without inserting a second row.
++	selectDeploymentForDispatch: fmt.Sprintf(`
++		SELECT %s
++		FROM %s
++		WHERE deleted_at IS NULL AND deployment_id = $1;
++	`, deploymentDispatchColumns, tableDeploys),
++
++	// selectDeploymentByDeliveryClaim finds the deployment a claim already
++	// created when the claim itself lost the id in a crash.
++	selectDeploymentByDeliveryClaim: fmt.Sprintf(`
++		SELECT %s
++		FROM %s
++		WHERE deleted_at IS NULL AND delivery_result_id = $1
++		ORDER BY deployment_id DESC
++		LIMIT 1;
++	`, deploymentDispatchColumns, tableDeploys),
++
+ 	restartDeployment: `
+ 		UPDATE deployments SET
+ 			created_at = NOW() AT TIME ZONE 'UTC',
+diff --git a/src/ce/api/app/deploy/deployment_store.go b/src/ce/api/app/deploy/deployment_store.go
+index 1d40ab0..37d320d 100644
+--- a/src/ce/api/app/deploy/deployment_store.go
++++ b/src/ce/api/app/deploy/deployment_store.go
+@@ -266,12 +266,18 @@ func (s *Store) InsertDeployment(ctx context.Context, d *Deployment) error {
+ 
+ 	configCopyStr := string(d.ConfigCopy)
+ 
++	var deliveryResultID any
++
++	if d.DeliveryResultID != 0 {
++		deliveryResultID = d.DeliveryResultID
++	}
++
+ 	params := []any{
+ 		d.AppID, null.NewString(configCopyStr, configCopyStr != ""), branch, d.Env, d.EnvID,
+ 		d.IsAutoDeploy, d.PullRequestNumber,
+ 		d.Commit.ID, d.IsFork, d.ShouldPublish, repo,
+ 		d.APIPathPrefix, webhookEvent, d.Commit.Author,
+-		d.MigrationsFolder, d.IsPriority,
++		d.MigrationsFolder, d.IsPriority, deliveryResultID,
+ 	}
+ 
+ 	row, err := s.QueryRow(ctx, stmt.insertDeployment, params...)
+@@ -283,6 +289,59 @@ func (s *Store) InsertDeployment(ctx context.Context, d *Deployment) error {
+ 	return row.Scan(&d.ID, &d.CreatedAt)
+ }
+ 
++// DeploymentForDispatch loads a persisted deployment with every field
++// deployservice needs to rebuild its build-queue message. The build config is
++// restored from the config snapshot taken when the deployment was created, so
++// later environment edits never change what a recovered deployment builds.
++// It returns nil (no error) when the deployment does not exist.
++func (s *Store) DeploymentForDispatch(ctx context.Context, id types.ID) (*Deployment, error) {
++	return s.deploymentForDispatch(ctx, stmt.selectDeploymentForDispatch, id)
++}
++
++// DeploymentByDeliveryResult returns the deployment linked to a delivery
++// claim. It closes the crash window between InsertDeployment and persisting
++// the id back onto the claim. Returns nil (no error) when none is linked.
++func (s *Store) DeploymentByDeliveryResult(ctx context.Context, resultID types.ID) (*Deployment, error) {
++	return s.deploymentForDispatch(ctx, stmt.selectDeploymentByDeliveryClaim, resultID)
++}
++
++func (s *Store) deploymentForDispatch(ctx context.Context, query string, id types.ID) (*Deployment, error) {
++	row, err := s.QueryRow(ctx, query, id)
++
++	if err != nil {
++		return nil, err
++	}
++
++	d := &Deployment{}
++
++	err = row.Scan(
++		&d.ID, &d.AppID, &d.EnvID, &d.Env,
++		&d.Branch, &d.CheckoutRepo,
++		&d.PullRequestNumber, &d.ShouldPublish,
++		&d.IsPriority, &d.MigrationsFolder, &d.ConfigCopy,
++	)
++
++	if err == sql.ErrNoRows {
++		return nil, nil
++	}
++
++	if err != nil {
++		return nil, err
++	}
++
++	if len(d.ConfigCopy) > 0 {
++		snapshot := ConfigSnapshot{}
++
++		if err := json.Unmarshal(d.ConfigCopy, &snapshot); err != nil {
++			return nil, err
++		}
++
++		d.BuildConfig = snapshot.BuildConfig
++	}
++
++	return d, nil
++}
++
+ // UpdateLogs will update the deployment logs for the given deployment id.
+ func (s *Store) UpdateLogs(ctx context.Context, did types.ID, logs string) error {
+ 	if logs == "" {
+diff --git a/src/ce/api/app/deploy/webhookdelivery/delivery_model.go b/src/ce/api/app/deploy/webhookdelivery/delivery_model.go
+new file mode 100644
+index 0000000..a7bfc83
+--- /dev/null
++++ b/src/ce/api/app/deploy/webhookdelivery/delivery_model.go
+@@ -0,0 +1,85 @@
++// Package webhookdelivery persists the claim state of inbound deploy webhooks
++// that carry a provider delivery identity. One webhook_deliveries row stores
++// the original event, and one webhook_delivery_results row stores the outcome
++// for each application/environment the event matched. The rows are the only
++// source of truth for deduplication: a duplicate delivery or a process restart
++// after the claim can be resolved without starting a second deployment.
++package webhookdelivery
++
++import (
++	"encoding/json"
++	"time"
++
++	"gopkg.in/guregu/null.v3"
++
++	"github.com/stormkit-io/stormkit-io/src/lib/types"
++)
++
++const (
++	ProviderGitHub    = "github"
++	ProviderGitLab    = "gitlab"
++	ProviderBitbucket = "bitbucket"
++)
++
++// Result statuses.
++const (
++	// StatusProcessing means the result row is claimed and the deployment is
++	// being created and dispatched. ClaimedAt is the lease: once it expires
++	// another delivery or the background job may reclaim the row.
++	StatusProcessing = "processing"
++
++	// StatusSucceeded means the deployment was created and dispatched exactly
++	// once. Redeliveries become no-ops.
++	StatusSucceeded = "succeeded"
++
++	// StatusRetryable means a recoverable failure happened while creating or
++	// dispatching the deployment. NextRetryAt says when the background job is
++	// allowed to try again; a provider redelivery reclaims immediately.
++	StatusRetryable = "retryable"
++)
++
++// Delivery is the original provider event, keyed by provider and the
++// provider's delivery GUID.
++type Delivery struct {
++	ID                types.ID
++	Provider          string
++	ProviderDelivery  string
++	Repo              string
++	CheckoutRepo      string
++	Branch            string
++	Message           string
++	EventType         string
++	CommitSha         string
++	PullRequestNumber int64
++	IsFork            bool
++	ChangesComplete   bool
++	ChangedFiles      []string
++	Payload           json.RawMessage
++
++	CreatedAt time.Time
++	UpdatedAt time.Time
++}
++
++// Result is the per application/environment outcome of a delivery.
++type Result struct {
++	ID         types.ID
++	DeliveryID types.ID
++	AppID      types.ID
++	EnvID      types.ID
++	EnvName    string
++
++	Status string
++
++	// DeploymentID links the deployment the claim created. It stays zero
++	// until the insert succeeds.
++	DeploymentID types.ID
++
++	Attempts   int
++	LastError  null.String
++	ClaimedAt  null.Time
++	FinishedAt null.Time
++	NextRetryAt null.Time
++
++	CreatedAt time.Time
++	UpdatedAt time.Time
++}
+diff --git a/src/ce/api/app/deploy/webhookdelivery/delivery_statements.go b/src/ce/api/app/deploy/webhookdelivery/delivery_statements.go
+new file mode 100644
+index 0000000..b24985a
+--- /dev/null
++++ b/src/ce/api/app/deploy/webhookdelivery/delivery_statements.go
+@@ -0,0 +1,144 @@
++package webhookdelivery
++
++var (
++	tableDeliveries = "webhook_deliveries"
++	tableResults    = "webhook_delivery_results"
++)
++
++type statement struct {
++	upsertDelivery    string
++	selectDelivery    string
++	selectResultByKey string
++	claimResult       string
++	reclaimResult     string
++	markSucceeded     string
++	markRetryable     string
++	dueResults        string
++}
++
++// resultColumns lists every persisted Result field, in the order scanResult
++// expects them.
++const resultColumns = `
++	result_id, delivery_id, app_id, env_id, COALESCE(env_name, ''),
++	status, COALESCE(deployment_id, 0), attempts,
++	last_error, claimed_at, finished_at, next_retry_at,
++	created_at, updated_at
++`
++
++var stmt = &statement{
++	// First write wins for the event itself: a redelivery never rewrites the
++	// original payload or normalized fields; only updated_at is touched.
++	upsertDelivery: `
++		INSERT INTO webhook_deliveries (
++			provider, provider_delivery_id, repo, checkout_repo, branch, message,
++			event_type, commit_sha, pull_request_number, is_fork, changes_complete,
++			changed_files, payload
++		)
++		VALUES (
++			$1, $2, $3, $4, $5, $6,
++			$7, $8, $9, $10, $11,
++			$12, $13
++		)
++		ON CONFLICT (provider, provider_delivery_id)
++		DO UPDATE SET updated_at = NOW() AT TIME ZONE 'UTC'
++		RETURNING delivery_id, created_at, updated_at;
++	`,
++
++	selectDelivery: `
++		SELECT
++			delivery_id, provider, provider_delivery_id,
++			COALESCE(repo, ''), COALESCE(checkout_repo, ''), COALESCE(branch, ''),
++			COALESCE(message, ''), COALESCE(event_type, ''), COALESCE(commit_sha, ''),
++			COALESCE(pull_request_number, 0), COALESCE(is_fork, false),
++			COALESCE(changes_complete, false), COALESCE(changed_files, '{}'),
++			COALESCE(payload, '{}'::jsonb), created_at, updated_at
++		FROM webhook_deliveries
++		WHERE delivery_id = $1;
++	`,
++
++	selectResultByKey: `
++		SELECT ` + resultColumns + `
++		FROM webhook_delivery_results
++		WHERE delivery_id = $1 AND app_id = $2 AND env_id = $3;
++	`,
++
++	// The unique index turns concurrent claims into one insert: the loser of
++	// the race gets no row back and has to read the existing claim.
++	claimResult: `
++		INSERT INTO webhook_delivery_results (
++			delivery_id, app_id, env_id, env_name, status, claimed_at, attempts
++		)
++		VALUES ($1, $2, $3, $4, 'processing', NOW() AT TIME ZONE 'UTC', 0)
++		ON CONFLICT (delivery_id, app_id, env_id) DO NOTHING
++		RETURNING ` + resultColumns + `;
++	`,
++
++	// A claim can only be taken over while it is still retryable or while its
++	// processing lease has expired. Succeeded rows and freshly held processing
++	// rows are untouchable.
++	reclaimResult: `
++		UPDATE webhook_delivery_results
++		SET
++			status = 'processing',
++			claimed_at = NOW() AT TIME ZONE 'UTC',
++			attempts = attempts + 1,
++			last_error = NULL,
++			next_retry_at = NULL,
++			updated_at = NOW() AT TIME ZONE 'UTC'
++		WHERE
++			result_id = $1
++			AND (
++				status = 'retryable'
++				OR (status = 'processing' AND claimed_at < $2)
++			)
++		RETURNING ` + resultColumns + `;
++	`,
++
++	// Only the current processing owner may close the claim, so a late
++	// callback from an expired lease cannot overwrite a newer attempt.
++	markSucceeded: `
++		UPDATE webhook_delivery_results
++		SET
++			status = 'succeeded',
++			deployment_id = CASE WHEN $2 = 0 THEN NULL ELSE $2 END,
++			last_error = NULL,
++			next_retry_at = NULL,
++			finished_at = NOW() AT TIME ZONE 'UTC',
++			updated_at = NOW() AT TIME ZONE 'UTC'
++		WHERE result_id = $1 AND status = 'processing';
++	`,
++
++	// A zero deployment id means no deployment was created on this attempt;
++	// keep whatever a previous attempt may have linked.
++	markRetryable: `
++		UPDATE webhook_delivery_results
++		SET
++			status = 'retryable',
++			deployment_id = CASE WHEN $2 = 0 THEN deployment_id ELSE $2 END,
++			last_error = $3,
++			next_retry_at = $4,
++			finished_at = NULL,
++			updated_at = NOW() AT TIME ZONE 'UTC'
++		WHERE result_id = $1 AND status <> 'succeeded';
++	`,
++
++	// Rows are locked skip-already-locked while the statement runs; because the
++	// store autocommits, that lock does not outlive the SELECT. Ownership is
++	// really taken by reclaimResult's conditional UPDATE, which is what
++	// prevents two workers from resuming the same claim.
++	dueResults: `
++		SELECT ` + resultColumns + `
++		FROM webhook_delivery_results
++		WHERE
++			(status = 'processing' AND claimed_at < $1)
++			OR (
++				status = 'retryable'
++				AND next_retry_at IS NOT NULL
++				AND next_retry_at <= $2
++				AND attempts < $3
++			)
++		ORDER BY claimed_at
++		LIMIT $4
++		FOR UPDATE SKIP LOCKED;
++	`,
++}
+diff --git a/src/ce/api/app/deploy/webhookdelivery/delivery_store.go b/src/ce/api/app/deploy/webhookdelivery/delivery_store.go
+new file mode 100644
+index 0000000..4198d5b
+--- /dev/null
++++ b/src/ce/api/app/deploy/webhookdelivery/delivery_store.go
+@@ -0,0 +1,226 @@
++package webhookdelivery
++
++import (
++	"context"
++	"database/sql"
++	"time"
++
++	"github.com/lib/pq"
++
++	"github.com/stormkit-io/stormkit-io/src/lib/database"
++	"github.com/stormkit-io/stormkit-io/src/lib/types"
++)
++
++// Store persists inbound webhook deliveries and their per-environment results.
++type Store struct {
++	*database.Store
++}
++
++// NewStore returns a store instance.
++func NewStore() *Store {
++	return &Store{database.NewStore()}
++}
++
++type rowScanner interface {
++	Scan(dest ...any) error
++}
++
++func scanDelivery(row rowScanner) (*Delivery, error) {
++	d := &Delivery{}
++
++	err := row.Scan(
++		&d.ID, &d.Provider, &d.ProviderDelivery,
++		&d.Repo, &d.CheckoutRepo, &d.Branch, &d.Message,
++		&d.EventType, &d.CommitSha, &d.PullRequestNumber,
++		&d.IsFork, &d.ChangesComplete, pq.Array(&d.ChangedFiles),
++		&d.Payload, &d.CreatedAt, &d.UpdatedAt,
++	)
++
++	if err != nil {
++		return nil, err
++	}
++
++	return d, nil
++}
++
++func scanResult(row rowScanner) (*Result, error) {
++	r := &Result{}
++
++	err := row.Scan(
++		&r.ID, &r.DeliveryID, &r.AppID, &r.EnvID, &r.EnvName,
++		&r.Status, &r.DeploymentID, &r.Attempts,
++		&r.LastError, &r.ClaimedAt, &r.FinishedAt, &r.NextRetryAt,
++		&r.CreatedAt, &r.UpdatedAt,
++	)
++
++	if err != nil {
++		return nil, err
++	}
++
++	return r, nil
++}
++
++// UpsertDelivery stores the event on its first receipt and returns its id.
++// Redeliveries keep the original fields and only touch updated_at.
++func (s *Store) UpsertDelivery(ctx context.Context, d *Delivery) (types.ID, error) {
++	var payload any
++
++	if len(d.Payload) > 0 {
++		payload = []byte(d.Payload)
++	}
++
++	row, err := s.QueryRow(ctx, stmt.upsertDelivery,
++		d.Provider, d.ProviderDelivery, d.Repo, d.CheckoutRepo, d.Branch, d.Message,
++		d.EventType, d.CommitSha, d.PullRequestNumber, d.IsFork, d.ChangesComplete,
++		pq.Array(d.ChangedFiles), payload,
++	)
++
++	if err != nil {
++		return 0, err
++	}
++
++	err = row.Scan(&d.ID, &d.CreatedAt, &d.UpdatedAt)
++
++	if err != nil {
++		return 0, err
++	}
++
++	return d.ID, nil
++}
++
++// DeliveryByID returns the stored event, or nil when it does not exist.
++func (s *Store) DeliveryByID(ctx context.Context, id types.ID) (*Delivery, error) {
++	row, err := s.QueryRow(ctx, stmt.selectDelivery, id)
++
++	if err != nil {
++		return nil, err
++	}
++
++	d, err := scanDelivery(row)
++
++	if err == sql.ErrNoRows {
++		return nil, nil
++	}
++
++	return d, err
++}
++
++// ResultByKey returns the result row for a delivery/app/environment triple, or
++// nil when it has not been claimed yet.
++func (s *Store) ResultByKey(ctx context.Context, deliveryID, appID, envID types.ID) (*Result, error) {
++	row, err := s.QueryRow(ctx, stmt.selectResultByKey, deliveryID, appID, envID)
++
++	if err != nil {
++		return nil, err
++	}
++
++	r, err := scanResult(row)
++
++	if err == sql.ErrNoRows {
++		return nil, nil
++	}
++
++	return r, err
++}
++
++// ClaimResult inserts a processing result for a delivery/app/environment. The
++// boolean is true when this call created the claim and therefore owns it; a
++// false result carries the pre-existing row untouched, so the caller can tell
++// succeeded, in-flight and retryable claims apart.
++func (s *Store) ClaimResult(ctx context.Context, deliveryID, appID, envID types.ID, envName string) (*Result, bool, error) {
++	row, err := s.QueryRow(ctx, stmt.claimResult, deliveryID, appID, envID, envName)
++
++	if err != nil {
++		return nil, false, err
++	}
++
++	r, err := scanResult(row)
++
++	if err == nil {
++		return r, true, nil
++	}
++
++	if err != sql.ErrNoRows {
++		return nil, false, err
++	}
++
++	// The unique index rejected the insert: read back the row that won.
++	existing, err := s.ResultByKey(ctx, deliveryID, appID, envID)
++
++	if err != nil {
++		return nil, false, err
++	}
++
++	return existing, false, nil
++}
++
++// ReclaimResult takes over a retryable claim or a processing claim whose lease
++// expired before leaseExpiry. It returns false when another processor still
++// owns the row or the claim already succeeded.
++func (s *Store) ReclaimResult(ctx context.Context, resultID types.ID, leaseExpiry time.Time) (bool, *Result, error) {
++	row, err := s.QueryRow(ctx, stmt.reclaimResult, resultID, leaseExpiry)
++
++	if err != nil {
++		return false, nil, err
++	}
++
++	r, err := scanResult(row)
++
++	if err == sql.ErrNoRows {
++		return false, nil, nil
++	}
++
++	if err != nil {
++		return false, nil, err
++	}
++
++	return true, r, nil
++}
++
++// MarkSucceeded closes a claim with the deployment it produced.
++func (s *Store) MarkSucceeded(ctx context.Context, resultID, deploymentID types.ID) error {
++	_, err := s.Exec(ctx, stmt.markSucceeded, resultID, deploymentID)
++	return err
++}
++
++// MarkRetryable records a recoverable failure and the earliest time the
++// background job is allowed to try again. A zero deploymentID preserves a link
++// established by an earlier attempt.
++func (s *Store) MarkRetryable(ctx context.Context, resultID, deploymentID types.ID, errMessage string, nextRetryAt *time.Time) error {
++	var nextRetry any
++
++	if nextRetryAt != nil {
++		nextRetry = *nextRetryAt
++	}
++
++	_, err := s.Exec(ctx, stmt.markRetryable, resultID, deploymentID, errMessage, nextRetry)
++	return err
++}
++
++// DueResults returns claims the recovery job should take over: processing
++// rows whose lease expired before leaseExpiry and retryable rows whose backoff
++// is due at now, up to limit. Rows are locked skip-already-locked so multiple
++// workers never pick the same claim.
++func (s *Store) DueResults(ctx context.Context, leaseExpiry, now time.Time, maxAttempts, limit int) ([]*Result, error) {
++	rows, err := s.Query(ctx, stmt.dueResults, leaseExpiry, now, maxAttempts, limit)
++
++	if err != nil {
++		return nil, err
++	}
++
++	defer rows.Close()
++
++	results := []*Result{}
++
++	for rows.Next() {
++		r, err := scanResult(rows)
++
++		if err != nil {
++			return nil, err
++		}
++
++		results = append(results, r)
++	}
++
++	return results, rows.Err()
++}
+diff --git a/src/ce/api/app/deploy/webhookdelivery/delivery_store_test.go b/src/ce/api/app/deploy/webhookdelivery/delivery_store_test.go
+new file mode 100644
+index 0000000..20d147f
+--- /dev/null
++++ b/src/ce/api/app/deploy/webhookdelivery/delivery_store_test.go
+@@ -0,0 +1,308 @@
++package webhookdelivery_test
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/suite"
++
++	"github.com/stormkit-io/stormkit-io/src/ce/api/app/deploy/webhookdelivery"
++	"github.com/stormkit-io/stormkit-io/src/lib/database"
++	"github.com/stormkit-io/stormkit-io/src/lib/database/databasetest"
++	"github.com/stormkit-io/stormkit-io/src/lib/factory"
++	"github.com/stormkit-io/stormkit-io/src/lib/types"
++)
++
++type DeliveryStoreSuite struct {
++	suite.Suite
++	*factory.Factory
++	conn  databasetest.TestDB
++	store *webhookdelivery.Store
++	ctx   context.Context
++}
++
++func (s *DeliveryStoreSuite) BeforeTest(suiteName, _ string) {
++	s.conn = databasetest.InitTx(suiteName)
++	s.Factory = factory.New(s.conn)
++	s.store = webhookdelivery.NewStore()
++	s.ctx = context.Background()
++}
++
++// newDeploymentID creates a real deployment so the results table foreign key
++// is satisfied.
++func (s *DeliveryStoreSuite) newDeploymentID() types.ID {
++	appl := s.MockApp(nil, nil)
++	env := s.MockEnv(appl, nil)
++	return s.MockDeployment(env, nil).ID
++}
++
++func (s *DeliveryStoreSuite) AfterTest(_, _ string) {
++	s.conn.CloseTx()
++}
++
++func (s *DeliveryStoreSuite) sampleDelivery(provider, guid string) *webhookdelivery.Delivery {
++	return &webhookdelivery.Delivery{
++		Provider:          provider,
++		ProviderDelivery:  guid,
++		Repo:              provider + "/stormkit-io/test-repo",
++		CheckoutRepo:      provider + "/stormkit-io/test-repo",
++		Branch:            "main",
++		Message:           "chore: first delivery",
++		EventType:         "commit",
++		CommitSha:         "abc123",
++		PullRequestNumber: 0,
++		IsFork:            false,
++		ChangesComplete:   true,
++		ChangedFiles:      []string{"apps/web/main.go", "README.md"},
++		Payload:           []byte(`{"ref":"refs/heads/main"}`),
++	}
++}
++
++func (s *DeliveryStoreSuite) Test_UpsertDelivery_FirstWriteWins() {
++	d := s.sampleDelivery(webhookdelivery.ProviderGitHub, "guid-1")
++
++	id, err := s.store.UpsertDelivery(s.ctx, d)
++	s.Require().NoError(err)
++	s.NotZero(id)
++
++	stored, err := s.store.DeliveryByID(s.ctx, id)
++	s.Require().NoError(err)
++	s.Equal("github/stormkit-io/test-repo", stored.Repo)
++	s.Equal("main", stored.Branch)
++	s.Equal("abc123", stored.CommitSha)
++	s.Equal([]string{"apps/web/main.go", "README.md"}, stored.ChangedFiles)
++	s.JSONEq(`{"ref":"refs/heads/main"}`, string(stored.Payload))
++
++	// A redelivery carries different content, but the first receipt wins.
++	redelivery := s.sampleDelivery(webhookdelivery.ProviderGitHub, "guid-1")
++	redelivery.Branch = "main-changed"
++	redelivery.Message = "chore: rewritten"
++	redelivery.Payload = []byte(`{"ref":"other"}`)
++
++	sameID, err := s.store.UpsertDelivery(s.ctx, redelivery)
++	s.Require().NoError(err)
++	s.Equal(id, sameID)
++
++	stored, err = s.store.DeliveryByID(s.ctx, id)
++	s.Require().NoError(err)
++	s.Equal("main", stored.Branch)
++	s.Equal("chore: first delivery", stored.Message)
++	s.JSONEq(`{"ref":"refs/heads/main"}`, string(stored.Payload))
++}
++
++// Test_UpsertDelivery_ProviderScopedKey verifies that the same GUID from two
++// different providers is two independent events.
++func (s *DeliveryStoreSuite) Test_UpsertDelivery_ProviderScopedKey() {
++	first := s.sampleDelivery(webhookdelivery.ProviderGitHub, "shared-guid")
++	second := s.sampleDelivery(webhookdelivery.ProviderGitLab, "shared-guid")
++
++	firstID, err := s.store.UpsertDelivery(s.ctx, first)
++	s.Require().NoError(err)
++
++	secondID, err := s.store.UpsertDelivery(s.ctx, second)
++	s.Require().NoError(err)
++
++	s.NotEqual(firstID, secondID)
++}
++
++func (s *DeliveryStoreSuite) Test_ClaimResult_NewAndExisting() {
++	d := s.sampleDelivery(webhookdelivery.ProviderGitHub, "claim-1")
++	deliveryID, err := s.store.UpsertDelivery(s.ctx, d)
++	s.Require().NoError(err)
++
++	claimed, created, err := s.store.ClaimResult(s.ctx, deliveryID, 10, 20, "production")
++	s.Require().NoError(err)
++	s.True(created)
++	s.Equal(webhookdelivery.StatusProcessing, claimed.Status)
++	s.Zero(claimed.DeploymentID)
++	s.Zero(claimed.Attempts)
++	s.True(claimed.ClaimedAt.Valid)
++
++	// Concurrent loser: the existing row comes back untouched.
++	again, created, err := s.store.ClaimResult(s.ctx, deliveryID, 10, 20, "production")
++	s.Require().NoError(err)
++	s.False(created)
++	s.Equal(claimed.ID, again.ID)
++	s.Equal(webhookdelivery.StatusProcessing, again.Status)
++	s.Zero(again.Attempts)
++
++	missing, err := s.store.ResultByKey(s.ctx, deliveryID, 99, 99)
++	s.Require().NoError(err)
++	s.Nil(missing)
++
++	// The (delivery, app, env) triple is unique at the database level. Done
++	// last: the failed insert aborts the surrounding test transaction.
++	_, err = s.conn.Exec(`
++		INSERT INTO webhook_delivery_results (delivery_id, app_id, env_id, status)
++		VALUES ($1, 10, 20, 'processing')
++	`, deliveryID)
++	s.Require().Error(err)
++	s.True(database.IsDuplicate(err))
++}
++
++func (s *DeliveryStoreSuite) Test_ClaimResult_ReturnsSucceededRow() {
++	d := s.sampleDelivery(webhookdelivery.ProviderGitLab, "claim-2")
++	deliveryID, err := s.store.UpsertDelivery(s.ctx, d)
++	s.Require().NoError(err)
++
++	claimed, _, err := s.store.ClaimResult(s.ctx, deliveryID, 10, 20, "production")
++	s.Require().NoError(err)
++
++	deploymentID := s.newDeploymentID()
++	s.Require().NoError(s.store.MarkSucceeded(s.ctx, claimed.ID, deploymentID))
++
++	again, _, err := s.store.ClaimResult(s.ctx, deliveryID, 10, 20, "production")
++	s.Require().NoError(err)
++	s.Equal(webhookdelivery.StatusSucceeded, again.Status)
++	s.Equal(deploymentID, again.DeploymentID)
++}
++
++func (s *DeliveryStoreSuite) Test_ReclaimResult_LeaseAndStatusGuards() {
++	d := s.sampleDelivery(webhookdelivery.ProviderGitHub, "reclaim-1")
++	deliveryID, err := s.store.UpsertDelivery(s.ctx, d)
++	s.Require().NoError(err)
++
++	claimed, _, err := s.store.ClaimResult(s.ctx, deliveryID, 10, 20, "production")
++	s.Require().NoError(err)
++
++	lease := time.Now().Add(-2 * time.Minute)
++
++	// Fresh processing rows cannot be taken over.
++	acquired, _, err := s.store.ReclaimResult(s.ctx, claimed.ID, lease)
++	s.Require().NoError(err)
++	s.False(acquired)
++
++	// Expired the lease.
++	_, err = s.conn.Exec(`
++		UPDATE webhook_delivery_results
++		SET claimed_at = NOW() AT TIME ZONE 'UTC' - INTERVAL '10 minutes'
++		WHERE result_id = $1`, claimed.ID)
++	s.Require().NoError(err)
++
++	acquired, retaken, err := s.store.ReclaimResult(s.ctx, claimed.ID, lease)
++	s.Require().NoError(err)
++	s.True(acquired)
++	s.Equal(1, retaken.Attempts)
++	s.Equal(webhookdelivery.StatusProcessing, retaken.Status)
++	s.False(retaken.NextRetryAt.Valid)
++
++	// Retryable claims can always be taken; another attempt is counted.
++	nextRetry := time.Now().Add(time.Minute)
++	s.Require().NoError(s.store.MarkRetryable(s.ctx, claimed.ID, 0, "queue down", &nextRetry))
++
++	acquired, retaken, err = s.store.ReclaimResult(s.ctx, claimed.ID, lease)
++	s.Require().NoError(err)
++	s.True(acquired)
++	s.Equal(2, retaken.Attempts)
++
++	// Succeeded claims are final.
++	s.Require().NoError(s.store.MarkSucceeded(s.ctx, claimed.ID, s.newDeploymentID()))
++
++	acquired, _, err = s.store.ReclaimResult(s.ctx, claimed.ID, lease)
++	s.Require().NoError(err)
++	s.False(acquired)
++}
++
++func (s *DeliveryStoreSuite) Test_MarkRetryable_PersistsFailureAndKeepsDeployment() {
++	d := s.sampleDelivery(webhookdelivery.ProviderBitbucket, "retry-1")
++	deliveryID, err := s.store.UpsertDelivery(s.ctx, d)
++	s.Require().NoError(err)
++
++	claimed, _, err := s.store.ClaimResult(s.ctx, deliveryID, 10, 20, "production")
++	s.Require().NoError(err)
++
++	deploymentID := s.newDeploymentID()
++
++	nextRetry := time.Now().Add(2 * time.Minute)
++	s.Require().NoError(s.store.MarkRetryable(s.ctx, claimed.ID, deploymentID, "enqueue failed", &nextRetry))
++
++	r, err := s.store.ResultByKey(s.ctx, deliveryID, 10, 20)
++	s.Require().NoError(err)
++	s.Equal(webhookdelivery.StatusRetryable, r.Status)
++	s.Equal(deploymentID, r.DeploymentID)
++	s.Equal("enqueue failed", r.LastError.String)
++	s.True(r.NextRetryAt.Valid)
++	s.False(r.FinishedAt.Valid)
++
++	// A later attempt without a deployment id must not erase the link.
++	future := time.Now().Add(4 * time.Minute)
++	s.Require().NoError(s.store.MarkRetryable(s.ctx, claimed.ID, 0, "still failing", &future))
++
++	r, err = s.store.ResultByKey(s.ctx, deliveryID, 10, 20)
++	s.Require().NoError(err)
++	s.Equal(deploymentID, r.DeploymentID)
++
++	// A redelivery reclaims the retryable claim (back to processing) before a
++	// successful attempt can close it.
++	acquired, _, err := s.store.ReclaimResult(s.ctx, claimed.ID, time.Now())
++	s.Require().NoError(err)
++	s.True(acquired)
++
++	s.Require().NoError(s.store.MarkSucceeded(s.ctx, claimed.ID, deploymentID))
++
++	// Terminal rows are never moved back to retryable.
++	s.NoError(s.store.MarkRetryable(s.ctx, claimed.ID, deploymentID, "late failure", nil))
++
++	r, err = s.store.ResultByKey(s.ctx, deliveryID, 10, 20)
++	s.Require().NoError(err)
++	s.Equal(webhookdelivery.StatusSucceeded, r.Status)
++}
++
++func (s *DeliveryStoreSuite) Test_DueResults_Selection() {
++	d := s.sampleDelivery(webhookdelivery.ProviderGitHub, "due-1")
++	deliveryID, err := s.store.UpsertDelivery(s.ctx, d)
++	s.Require().NoError(err)
++
++	// Helper to create a claim at arbitrary app/env triples.
++	claim := func(appID, envID types.ID) types.ID {
++		r, _, err := s.store.ClaimResult(s.ctx, deliveryID, appID, envID, "production")
++		s.Require().NoError(err)
++		return r.ID
++	}
++
++	staleProcessing := claim(1, 1)
++	freshProcessing := claim(1, 2)
++	dueRetryable := claim(1, 3)
++	futureRetryable := claim(1, 4)
++	exhaustedRetryable := claim(1, 5)
++	succeeded := claim(1, 6)
++
++	_, err = s.conn.Exec(`
++		UPDATE webhook_delivery_results SET claimed_at = NOW() AT TIME ZONE 'UTC' - INTERVAL '10 minutes'
++		WHERE result_id IN ($1, $2, $3, $4, $5)`,
++		staleProcessing, dueRetryable, futureRetryable, exhaustedRetryable, succeeded)
++	s.Require().NoError(err)
++
++	past := time.Now().Add(-time.Minute)
++	future := time.Now().Add(time.Hour)
++
++	s.Require().NoError(s.store.MarkRetryable(s.ctx, dueRetryable, 0, "err", &past))
++	s.Require().NoError(s.store.MarkRetryable(s.ctx, futureRetryable, 0, "err", &future))
++	s.Require().NoError(s.store.MarkRetryable(s.ctx, exhaustedRetryable, 0, "err", &past))
++	s.Require().NoError(s.store.MarkSucceeded(s.ctx, succeeded, s.newDeploymentID()))
++
++	// exhaustedRetryable has already spent its attempts; bump it to the cap.
++	_, err = s.conn.Exec(`UPDATE webhook_delivery_results SET attempts = 10 WHERE result_id = $1`, exhaustedRetryable)
++	s.Require().NoError(err)
++
++	due, err := s.store.DueResults(s.ctx, time.Now().Add(-2*time.Minute), time.Now(), 10, 50)
++	s.Require().NoError(err)
++
++	dueIDs := map[types.ID]bool{}
++	for _, r := range due {
++		dueIDs[r.ID] = true
++	}
++
++	s.True(dueIDs[staleProcessing], "stale processing claim is due")
++	s.True(dueIDs[dueRetryable], "retryable claim with elapsed backoff is due")
++	s.False(dueIDs[freshProcessing], "fresh processing claim is not due")
++	s.False(dueIDs[futureRetryable], "retryable claim with future backoff is not due")
++	s.False(dueIDs[exhaustedRetryable], "retryable claim at the attempt cap is not due")
++	s.False(dueIDs[succeeded], "succeeded claim is never due")
++	s.Len(due, 2)
++}
++
++func TestDeliveryStore(t *testing.T) {
++	suite.Run(t, &DeliveryStoreSuite{})
++}
+diff --git a/src/ce/api/app/deployservice/deployer.go b/src/ce/api/app/deployservice/deployer.go
+index f5b7a9c..642bf7b 100644
+--- a/src/ce/api/app/deployservice/deployer.go
++++ b/src/ce/api/app/deployservice/deployer.go
+@@ -2,10 +2,12 @@ package deployservice
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"regexp"
+ 	"strings"
+ 
++	"github.com/hibiken/asynq"
+ 	"github.com/stormkit-io/stormkit-io/src/ce/api/admin"
+ 	"github.com/stormkit-io/stormkit-io/src/ce/api/app"
+ 	"github.com/stormkit-io/stormkit-io/src/ce/api/app/buildconf"
+@@ -23,6 +25,11 @@ var ErrBuildMinutesExceeded = fmt.Errorf("build minutes limit exceeded")
+ 
+ type Deployer interface {
+ 	Deploy(context.Context, *app.App, *deploy.Deployment) error
++
++	// Dispatch sends an already persisted deployment to the build queue. It is
++	// the recovery half of Deploy: webhook delivery claims call it when the
++	// deployment row exists but the queue dispatch may not have happened.
++	Dispatch(context.Context, *app.App, *deploy.Deployment) error
+ }
+ 
+ type DefaultDeployer struct {
+@@ -38,11 +45,25 @@ func New() Deployer {
+ 	return &DefaultDeployer{}
+ }
+ 
++// Deploy creates the deployment and dispatches it to the build queue.
+ func (dd *DefaultDeployer) Deploy(ctx context.Context, a *app.App, d *deploy.Deployment) error {
+-	// Build caching is available to everyone on self-hosted instances. On
+-	// Stormkit Cloud it is an enterprise feature: premium and ultimate only.
+-	cacheEnabled := !config.IsStormkitCloud()
++	if err := dd.createDeployment(ctx, a, d); err != nil {
++		return err
++	}
++
++	return dd.dispatchDeployment(ctx, a, d)
++}
++
++// Dispatch re-dispatches an existing deployment without inserting a new row.
++func (dd *DefaultDeployer) Dispatch(ctx context.Context, a *app.App, d *deploy.Deployment) error {
++	return dd.dispatchDeployment(ctx, a, d)
++}
+ 
++// createDeployment runs every check the deploy needs, snapshots the config and
++// inserts the deployment row. Nothing here reaches the build queue yet.
++func (dd *DefaultDeployer) createDeployment(ctx context.Context, a *app.App, d *deploy.Deployment) error {
++	// Build minutes are enforced on Stormkit Cloud before anything occupies a
++	// runner or a queue slot.
+ 	if config.IsStormkitCloud() {
+ 		store := user.NewStore()
+ 		usr, err := store.UserMetrics(ctx, user.UserMetricsArgs{AppID: a.ID})
+@@ -54,23 +75,6 @@ func (dd *DefaultDeployer) Deploy(ctx context.Context, a *app.App, d *deploy.Dep
+ 		if usr != nil && !usr.HasBuildMinutes() {
+ 			return ErrBuildMinutesExceeded
+ 		}
+-
+-		// UserMetrics already carries the owner's package, but it returns no
+-		// row until the first usage entry of the month exists; fall back to a
+-		// dedicated lookup in that case. Build caching is best-effort, so a
+-		// failed entitlement lookup disables caching instead of failing the
+-		// deployment.
+-		tier := ""
+-
+-		if usr != nil {
+-			tier = usr.Metadata.PackageName
+-		} else if t, err := store.PackageNameByAppID(ctx, a.ID); err != nil {
+-			slog.Errorf("could not resolve package for app %d: %v", a.ID, err)
+-		} else {
+-			tier = t
+-		}
+-
+-		cacheEnabled = tier == config.PackagePremium || tier == config.PackageUltimate
+ 	}
+ 
+ 	// Rejected here rather than on the build host: the provider already knows
+@@ -80,19 +84,6 @@ func (dd *DefaultDeployer) Deploy(ctx context.Context, a *app.App, d *deploy.Dep
+ 		return err
+ 	}
+ 
+-	// Get git credentials
+-	gitCreds, err := a.GitCreds(ctx)
+-
+-	if err != nil {
+-		return err
+-	}
+-
+-	// The credentials grant access to the app's repository. Never hand them to
+-	// a build that checks out a different one, such as a fork.
+-	if d.CheckoutRepo != "" && !strings.EqualFold(d.CheckoutRepo, a.Repo) {
+-		gitCreds = ""
+-	}
+-
+ 	d.ConfigCopy, _ = d.MarshalConfigSnapshot()
+ 
+ 	if d.BuildConfig == nil {
+@@ -125,11 +116,36 @@ func (dd *DefaultDeployer) Deploy(ctx context.Context, a *app.App, d *deploy.Dep
+ 		}
+ 	}
+ 
++	return nil
++}
++
++// dispatchDeployment builds the runner message for an already persisted
++// deployment and enqueues it. It is self-contained so a crash-recovery
++// re-dispatch does not have to replay the create-phase checks or insert a
++// second deployment row.
++func (dd *DefaultDeployer) dispatchDeployment(ctx context.Context, a *app.App, d *deploy.Deployment) error {
++	// Get git credentials
++	gitCreds, err := a.GitCreds(ctx)
++
++	if err != nil {
++		return err
++	}
++
++	// The credentials grant access to the app's repository. Never hand them to
++	// a build that checks out a different one, such as a fork.
++	if d.CheckoutRepo != "" && !strings.EqualFold(d.CheckoutRepo, a.Repo) {
++		gitCreds = ""
++	}
++
++	if d.BuildConfig == nil {
++		d.BuildConfig = &buildconf.BuildConf{}
++	}
++
+ 	// When caching is not allowed the runner receives no cache directories,
+ 	// which is how it decides whether to restore and snapshot the cache.
+ 	cacheDirs := d.BuildConfig.CacheDirs
+ 
+-	if !cacheEnabled {
++	if !cacheEnabledForDeploy(ctx, a) {
+ 		cacheDirs = nil
+ 	}
+ 
+@@ -184,6 +200,35 @@ func (dd *DefaultDeployer) Deploy(ctx context.Context, a *app.App, d *deploy.Dep
+ 	return dd.sendPayloadToRedis(ctx, sendPayloadToRedisParams{message: payload, queue: queue})
+ }
+ 
++// cacheEnabledForDeploy reports whether the deployment may use build caching.
++// Everyone on self-hosted may; on Stormkit Cloud it is a premium and ultimate
++// feature. A failed entitlement lookup disables caching instead of failing the
++// deployment, because caching is best-effort.
++func cacheEnabledForDeploy(ctx context.Context, a *app.App) bool {
++	if !config.IsStormkitCloud() {
++		return true
++	}
++
++	store := user.NewStore()
++	tier := ""
++
++	if usr, err := store.UserMetrics(ctx, user.UserMetricsArgs{AppID: a.ID}); err != nil {
++		slog.Errorf("could not resolve package for app %d: %v", a.ID, err)
++	} else if usr != nil {
++		tier = usr.Metadata.PackageName
++	}
++
++	if tier == "" {
++		if t, err := store.PackageNameByAppID(ctx, a.ID); err != nil {
++			slog.Errorf("could not resolve package for app %d: %v", a.ID, err)
++		} else {
++			tier = t
++		}
++	}
++
++	return tier == config.PackagePremium || tier == config.PackageUltimate
++}
++
+ type sendPayloadToRedisParams struct {
+ 	message DeploymentMessage
+ 	queue   string
+@@ -206,6 +251,13 @@ func (dd *DefaultDeployer) sendPayloadToRedis(ctx context.Context, p sendPayload
+ 		TaskID:    fmt.Sprintf("deployment-%s", p.message.Build.DeploymentID),
+ 	})
+ 
++	// A task with this deployment id is already queued or running, so the
++	// dispatch happened on an earlier attempt. Treat it as success rather than
++	// starting anything twice.
++	if errors.Is(err, asynq.ErrTaskIDConflict) {
++		return nil
++	}
++
+ 	if err != nil {
+ 		slog.Errorf("could not enqueue task: %v", err)
+ 	}
+diff --git a/src/ce/api/app/deployservice/deployer_test.go b/src/ce/api/app/deployservice/deployer_test.go
+index 3b5dc19..0962145 100644
+--- a/src/ce/api/app/deployservice/deployer_test.go
++++ b/src/ce/api/app/deployservice/deployer_test.go
+@@ -293,6 +293,50 @@ func (s *DeploySuite) Test_Deployment_NoMoreBuildMinutes() {
+ 	s.Equal(deployservice.ErrBuildMinutesExceeded, err)
+ }
+ 
++// enqueueErrorClient fails every enqueue with the configured error.
++type enqueueErrorClient struct {
++	err error
++}
++
++func (c *enqueueErrorClient) Enqueue(task *asynq.Task, opts ...asynq.Option) (*asynq.TaskInfo, error) {
++	return nil, c.err
++}
++
++// withEnqueueClient runs fn with the given TaskClient installed.
++func (s *DeploySuite) withEnqueueClient(client tasks.TaskClient, fn func()) {
++	prevClient := tasks.Client
++	tasks.Client = func() tasks.TaskClient { return client }
++
++	defer func() { tasks.Client = prevClient }()
++
++	fn()
++}
++
++// Test_Dispatch_TaskIDConflictIsSuccess verifies that re-dispatching a
++// deployment whose queue task is already present is treated as success, so
++// recovery never reports a failure or starts a second external build.
++func (s *DeploySuite) Test_Dispatch_TaskIDConflictIsSuccess() {
++	appl := s.MockApp(s.MockUser())
++	env := s.MockEnv(appl)
++	depl := s.MockDeployment(env)
++
++	s.withEnqueueClient(&enqueueErrorClient{err: asynq.ErrTaskIDConflict}, func() {
++		s.NoError((&deployservice.DefaultDeployer{}).Dispatch(context.Background(), appl.App, depl.Deployment))
++	})
++}
++
++// Test_Dispatch_EnqueueErrorPropagates verifies real queue failures still
++// surface, so the caller can mark the claim retryable.
++func (s *DeploySuite) Test_Dispatch_EnqueueErrorPropagates() {
++	appl := s.MockApp(s.MockUser())
++	env := s.MockEnv(appl)
++	depl := s.MockDeployment(env)
++
++	s.withEnqueueClient(&enqueueErrorClient{err: asynq.ErrQueueNotFound}, func() {
++		s.Error((&deployservice.DefaultDeployer{}).Dispatch(context.Background(), appl.App, depl.Deployment))
++	})
++}
++
+ func TestAppDeploy(t *testing.T) {
+ 	suite.Run(t, &DeploySuite{})
+ }
+diff --git a/src/ce/workerserver/job_webhook_deliveries.go b/src/ce/workerserver/job_webhook_deliveries.go
+new file mode 100644
+index 0000000..fc6ae6c
+--- /dev/null
++++ b/src/ce/workerserver/job_webhook_deliveries.go
+@@ -0,0 +1,15 @@
++package jobs
++
++import (
++	"context"
++
++	"github.com/stormkit-io/stormkit-io/src/ce/api/app/apphandlers"
++)
++
++// RecoverWebhookDeliveries resumes inbound deploy webhook claims that never
++// finished: processing claims whose lease expired after a crash and retryable
++// claims whose backoff is due. It runs on the leader, but every transition is
++// claim-gated so duplicate runs stay safe.
++func RecoverWebhookDeliveries(ctx context.Context) error {
++	return apphandlers.RecoverPendingWebhookDeliveries(ctx)
++}
+diff --git a/src/ce/workerserver/job_webhook_deliveries_test.go b/src/ce/workerserver/job_webhook_deliveries_test.go
+new file mode 100644
+index 0000000..912952b
+--- /dev/null
++++ b/src/ce/workerserver/job_webhook_deliveries_test.go
+@@ -0,0 +1,228 @@
++package jobs_test
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	"github.com/stretchr/testify/mock"
++	"github.com/stretchr/testify/suite"
++
++	"github.com/stormkit-io/stormkit-io/src/ce/api/app/deploy/webhookdelivery"
++	"github.com/stormkit-io/stormkit-io/src/ce/api/app/deployservice"
++	jobs "github.com/stormkit-io/stormkit-io/src/ce/workerserver"
++	"github.com/stormkit-io/stormkit-io/src/lib/database/databasetest"
++	"github.com/stormkit-io/stormkit-io/src/lib/factory"
++	"github.com/stormkit-io/stormkit-io/src/mocks"
++)
++
++type JobWebhookDeliveriesSuite struct {
++	suite.Suite
++	*factory.Factory
++	conn         databasetest.TestDB
++	mockDeployer *mocks.Deployer
++}
++
++func (s *JobWebhookDeliveriesSuite) BeforeTest(suiteName, _ string) {
++	s.conn = databasetest.InitTx(suiteName)
++	s.Factory = factory.New(s.conn)
++
++	s.mockDeployer = &mocks.Deployer{}
++	s.mockDeployer.On("Deploy", mock.Anything, mock.Anything, mock.Anything).Return(nil)
++	deployservice.MockDeployer = s.mockDeployer
++}
++
++func (s *JobWebhookDeliveriesSuite) AfterTest(_, _ string) {
++	deployservice.MockDeployer = nil
++	s.conn.CloseTx()
++}
++
++// Test_RecoverWebhookDeliveries verifies the scheduled entry point resumes a
++// stale claim and leaves fresh claims untouched.
++func (s *JobWebhookDeliveriesSuite) Test_RecoverWebhookDeliveries() {
++	appl := s.MockApp(nil, nil)
++	env := s.MockEnv(appl, nil)
++
++	store := webhookdelivery.NewStore()
++	ctx := context.Background()
++
++	deliveryID, err := store.UpsertDelivery(ctx, &webhookdelivery.Delivery{
++		Provider:         webhookdelivery.ProviderGitHub,
++		ProviderDelivery: "job-recovery-1",
++		Repo:             appl.Repo,
++		CheckoutRepo:     appl.Repo,
++		Branch:           "main",
++		EventType:        "commit",
++		ChangesComplete:  true,
++		Payload:          []byte(`{"ref":"refs/heads/main"}`),
++	})
++	s.Require().NoError(err)
++
++	stale, _, err := store.ClaimResult(ctx, deliveryID, appl.ID, env.ID, "production")
++	s.Require().NoError(err)
++
++	_, err = s.conn.Exec(`
++		UPDATE webhook_delivery_results
++		SET claimed_at = NOW() AT TIME ZONE 'UTC' - INTERVAL '10 minutes'
++		WHERE result_id = $1
++	`, stale.ID)
++	s.Require().NoError(err)
++
++	// A second, still fresh claim that must not be touched.
++	otherApp := s.MockApp(nil, nil)
++	otherEnv := s.MockEnv(otherApp, nil)
++
++	fresh, _, err := store.ClaimResult(ctx, deliveryID, otherApp.ID, otherEnv.ID, "production")
++	s.Require().NoError(err)
++
++	s.Require().NoError(jobs.RecoverWebhookDeliveries(ctx))
++
++	s.mockDeployer.AssertNumberOfCalls(s.T(), "Deploy", 1)
++
++	recovered, err := store.ResultByKey(ctx, deliveryID, appl.ID, env.ID)
++	s.Require().NoError(err)
++	s.Equal(webhookdelivery.StatusSucceeded, recovered.Status)
++
++	unchanged, err := store.ResultByKey(ctx, deliveryID, otherApp.ID, otherEnv.ID)
++	s.Require().NoError(err)
++	s.Equal(webhookdelivery.StatusProcessing, unchanged.Status)
++	s.Equal(fresh.ID, unchanged.ID)
++}
++
++// Test_RecoverDueRetryable verifies a retryable claim whose backoff elapsed is
++// resumed and closed.
++func (s *JobWebhookDeliveriesSuite) Test_RecoverDueRetryable() {
++	appl := s.MockApp(nil, nil)
++	env := s.MockEnv(appl, nil)
++
++	store := webhookdelivery.NewStore()
++	ctx := context.Background()
++
++	deliveryID, err := store.UpsertDelivery(ctx, &webhookdelivery.Delivery{
++		Provider:         webhookdelivery.ProviderGitHub,
++		ProviderDelivery: "job-recovery-2",
++		Repo:             appl.Repo,
++		CheckoutRepo:     appl.Repo,
++		Branch:           "main",
++		EventType:        "commit",
++		ChangesComplete:  true,
++		Payload:          []byte(`{"ref":"refs/heads/main"}`),
++	})
++	s.Require().NoError(err)
++
++	result, _, err := store.ClaimResult(ctx, deliveryID, appl.ID, env.ID, "production")
++	s.Require().NoError(err)
++
++	past := time.Now().Add(-time.Minute)
++	s.Require().NoError(store.MarkRetryable(ctx, result.ID, 0, "queue down", &past))
++
++	s.Require().NoError(jobs.RecoverWebhookDeliveries(ctx))
++
++	s.mockDeployer.AssertNumberOfCalls(s.T(), "Deploy", 1)
++
++	r, err := store.ResultByKey(ctx, deliveryID, appl.ID, env.ID)
++	s.Require().NoError(err)
++	s.Equal(webhookdelivery.StatusSucceeded, r.Status)
++}
++
++// Test_RecoverSkipsExhaustedRetry verifies claims at the attempt cap are not
++// retried automatically any more, even with an elapsed backoff.
++func (s *JobWebhookDeliveriesSuite) Test_RecoverSkipsExhaustedRetry() {
++	appl := s.MockApp(nil, nil)
++	env := s.MockEnv(appl, nil)
++
++	store := webhookdelivery.NewStore()
++	ctx := context.Background()
++
++	deliveryID, err := store.UpsertDelivery(ctx, &webhookdelivery.Delivery{
++		Provider:         webhookdelivery.ProviderGitHub,
++		ProviderDelivery: "job-recovery-3",
++		Repo:             appl.Repo,
++		Branch:           "main",
++	})
++	s.Require().NoError(err)
++
++	result, _, err := store.ClaimResult(ctx, deliveryID, appl.ID, env.ID, "production")
++	s.Require().NoError(err)
++
++	past := time.Now().Add(-time.Minute)
++	s.Require().NoError(store.MarkRetryable(ctx, result.ID, 0, "queue down", &past))
++	_, err = s.conn.Exec(`UPDATE webhook_delivery_results SET attempts = 10 WHERE result_id = $1`, result.ID)
++	s.Require().NoError(err)
++
++	s.Require().NoError(jobs.RecoverWebhookDeliveries(ctx))
++
++	s.mockDeployer.AssertNotCalled(s.T(), "Deploy")
++
++	r, err := store.ResultByKey(ctx, deliveryID, appl.ID, env.ID)
++	s.Require().NoError(err)
++	s.Equal(webhookdelivery.StatusRetryable, r.Status)
++	s.Equal(10, r.Attempts)
++}
++
++// Test_Recover_BadClaimDoesNotStopBatch verifies a claim whose stored event no
++// longer matches any candidate is parked retryable while the remaining due
++// claims in the same batch are still recovered.
++func (s *JobWebhookDeliveriesSuite) Test_Recover_BadClaimDoesNotStopBatch() {
++	store := webhookdelivery.NewStore()
++	ctx := context.Background()
++
++	// Claim with an unknown repository: replay cannot find a candidate.
++	badDeliveryID, err := store.UpsertDelivery(ctx, &webhookdelivery.Delivery{
++		Provider:         webhookdelivery.ProviderGitHub,
++		ProviderDelivery: "job-recovery-bad",
++		Repo:             "github/does-not-exist/repo",
++		Branch:           "main",
++	})
++	s.Require().NoError(err)
++
++	bad, _, err := store.ClaimResult(ctx, badDeliveryID, 999001, 999002, "production")
++	s.Require().NoError(err)
++	_, err = s.conn.Exec(`
++		UPDATE webhook_delivery_results
++		SET claimed_at = NOW() AT TIME ZONE 'UTC' - INTERVAL '10 minutes'
++		WHERE result_id = $1
++	`, bad.ID)
++	s.Require().NoError(err)
++
++	// Healthy claim that must still be recovered in the same run.
++	appl := s.MockApp(nil, nil)
++	env := s.MockEnv(appl, nil)
++
++	goodDeliveryID, err := store.UpsertDelivery(ctx, &webhookdelivery.Delivery{
++		Provider:         webhookdelivery.ProviderGitHub,
++		ProviderDelivery: "job-recovery-good",
++		Repo:             appl.Repo,
++		CheckoutRepo:     appl.Repo,
++		Branch:           "main",
++		EventType:        "commit",
++		ChangesComplete:  true,
++		Payload:          []byte(`{"ref":"refs/heads/main"}`),
++	})
++	s.Require().NoError(err)
++
++	good, _, err := store.ClaimResult(ctx, goodDeliveryID, appl.ID, env.ID, "production")
++	s.Require().NoError(err)
++	_, err = s.conn.Exec(`
++		UPDATE webhook_delivery_results
++		SET claimed_at = NOW() AT TIME ZONE 'UTC' - INTERVAL '10 minutes'
++		WHERE result_id = $1
++	`, good.ID)
++	s.Require().NoError(err)
++
++	s.Require().NoError(jobs.RecoverWebhookDeliveries(ctx))
++
++	s.mockDeployer.AssertNumberOfCalls(s.T(), "Deploy", 1)
++
++	badResult, err := store.ResultByKey(ctx, badDeliveryID, 999001, 999002)
++	s.Require().NoError(err)
++	s.Equal(webhookdelivery.StatusRetryable, badResult.Status)
++
++	goodResult, err := store.ResultByKey(ctx, goodDeliveryID, appl.ID, env.ID)
++	s.Require().NoError(err)
++	s.Equal(webhookdelivery.StatusSucceeded, goodResult.Status)
++}
++
++func TestJobWebhookDeliveriesSuite(t *testing.T) {
++	suite.Run(t, &JobWebhookDeliveriesSuite{})
++}
+diff --git a/src/ce/workerserver/worker_scheduler.go b/src/ce/workerserver/worker_scheduler.go
+index 90ade60..99e86ce 100644
+--- a/src/ce/workerserver/worker_scheduler.go
++++ b/src/ce/workerserver/worker_scheduler.go
+@@ -93,6 +93,7 @@ func (s *Scheduler) RegisterMasterTasks(ctx context.Context) {
+ 		{Handler: CleanupDeletedTeams, Def: dj(EVERY_HOUR), Opt: immediate},
+ 		{Handler: PingDomains, Def: dj(EVERY_MINUTE), Opt: immediate},
+ 		{Handler: TimedOutDeployments, Def: dj(EVERY_MINUTE), Opt: immediate},
++		{Handler: RecoverWebhookDeliveries, Def: dj(EVERY_MINUTE), Opt: immediate},
+ 	}
+ 
+ 	s.masterTasks = s.registerTasks(ctx, tasks)
+diff --git a/src/migrations/0029_2026-10-08.up.sql b/src/migrations/0029_2026-10-08.up.sql
+new file mode 100644
+index 0000000..4237991
+--- /dev/null
++++ b/src/migrations/0029_2026-10-08.up.sql
+@@ -0,0 +1,71 @@
++-- Persistent inbox for inbound deploy webhooks that carry a provider delivery
++-- identity (GitHub X-GitHub-Delivery, GitLab X-Gitlab-Event-UUID and Bitbucket
++-- X-Request-UUID). Duplicate deliveries and concurrent requests are claimed
++-- exactly once per matched application/environment, and a crash between the
++-- claim and the queue dispatch is recoverable from these rows.
++--
++-- webhook_deliveries stores the original event, keyed by the provider plus its
++-- delivery id: the same GUID from two different providers is two events.
++-- First write wins for the payload, so a redelivery never rewrites history.
++CREATE TABLE IF NOT EXISTS webhook_deliveries (
++    delivery_id           BIGSERIAL PRIMARY KEY,
++    provider              TEXT NOT NULL,
++    provider_delivery_id  TEXT NOT NULL,
++    repo                  TEXT,
++    checkout_repo         TEXT,
++    branch                TEXT,
++    message               TEXT,
++    event_type            TEXT,
++    commit_sha            TEXT,
++    pull_request_number   BIGINT,
++    is_fork               BOOLEAN,
++    changes_complete      BOOLEAN,
++    changed_files         TEXT[],
++    payload               JSONB,
++    created_at            TIMESTAMP WITHOUT TIME ZONE DEFAULT (NOW() AT TIME ZONE 'UTC') NOT NULL,
++    updated_at            TIMESTAMP WITHOUT TIME ZONE DEFAULT (NOW() AT TIME ZONE 'UTC') NOT NULL,
++    CONSTRAINT webhook_deliveries_provider_delivery_key UNIQUE (provider, provider_delivery_id)
++);
++
++-- One row per matched application/environment of a delivery. The same commit
++-- legitimately reaches several environments, so results are never merged: the
++-- unique key is the delivery together with the app and the environment.
++--
++-- status is one of:
++--   processing - claimed, deployment creation/dispatch in flight (claimed_at is the lease)
++--   succeeded  - deployment created and dispatched (deployment_id is set)
++--   retryable  - a recoverable failure; next_retry_at says when background retry is due
++CREATE TABLE IF NOT EXISTS webhook_delivery_results (
++    result_id      BIGSERIAL PRIMARY KEY,
++    delivery_id    BIGINT NOT NULL REFERENCES webhook_deliveries(delivery_id) ON DELETE CASCADE,
++    app_id         BIGINT NOT NULL,
++    env_id         BIGINT NOT NULL,
++    env_name       TEXT,
++    status         TEXT NOT NULL,
++    deployment_id  BIGINT REFERENCES deployments(deployment_id) ON DELETE SET NULL,
++    attempts       INTEGER NOT NULL DEFAULT 0,
++    last_error     TEXT,
++    claimed_at     TIMESTAMP WITHOUT TIME ZONE,
++    finished_at    TIMESTAMP WITHOUT TIME ZONE,
++    next_retry_at  TIMESTAMP WITHOUT TIME ZONE,
++    created_at     TIMESTAMP WITHOUT TIME ZONE DEFAULT (NOW() AT TIME ZONE 'UTC') NOT NULL,
++    updated_at     TIMESTAMP WITHOUT TIME ZONE DEFAULT (NOW() AT TIME ZONE 'UTC') NOT NULL,
++    CONSTRAINT webhook_delivery_results_delivery_app_env_key UNIQUE (delivery_id, app_id, env_id)
++);
++
++-- Recovery scans for expired leases and due retries.
++CREATE INDEX IF NOT EXISTS idx_webhook_delivery_results_status_retry
++    ON webhook_delivery_results (status, next_retry_at);
++
++-- Links an auto deployment back to the claim that created it. The partial
++-- unique index is the database-level guarantee that one claim never produces
++-- two live deployments, even when the process dies between the insert and the
++-- queue dispatch and recovery has to decide whether a deployment already
++-- exists. Soft-deleted deployments do not block the claim from deploying again.
++ALTER TABLE deployments
++    ADD COLUMN IF NOT EXISTS delivery_result_id BIGINT
++    REFERENCES webhook_delivery_results(result_id) ON DELETE SET NULL;
++
++CREATE UNIQUE INDEX IF NOT EXISTS idx_deployments_delivery_result_unique
++    ON deployments (delivery_result_id)
++    WHERE delivery_result_id IS NOT NULL AND deleted_at IS NULL;
+diff --git a/src/mocks/deployer.go b/src/mocks/deployer.go
+index 3636f91..cf235ed 100644
+--- a/src/mocks/deployer.go
++++ b/src/mocks/deployer.go
+@@ -35,6 +35,24 @@ func (_m *Deployer) Deploy(_a0 context.Context, _a1 *app.App, _a2 *deploy.Deploy
+ 	return r0
+ }
+ 
++// Dispatch provides a mock function with given fields: _a0, _a1, _a2
++func (_m *Deployer) Dispatch(_a0 context.Context, _a1 *app.App, _a2 *deploy.Deployment) error {
++	ret := _m.Called(_a0, _a1, _a2)
++
++	if len(ret) == 0 {
++		panic("no return value specified for Dispatch")
++	}
++
++	var r0 error
++	if rf, ok := ret.Get(0).(func(context.Context, *app.App, *deploy.Deployment) error); ok {
++		r0 = rf(_a0, _a1, _a2)
++	} else {
++		r0 = ret.Error(0)
++	}
++
++	return r0
++}
++
+ // NewDeployer creates a new instance of Deployer. It also registers a testing interface on the mock and a cleanup function to assert the mocks expectations.
+ // The first argument is typically a *testing.T value.
+ func NewDeployer(t interface {
